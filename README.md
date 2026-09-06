@@ -90,7 +90,13 @@ ssh-keygen -t ed25519 -f ~/.ssh/shop_backup_deploy -N '' -C "$(hostname)-shop-ba
 ```sh
 SSH_KEY="$HOME/.ssh/shop_backup_deploy"
 REMOTE_URL=git@github.com:backup-account/shop-backup.git
+# SSH_OPTIONS="-p 22"   # if the host's ssh_config sets another port for Host *
 ```
+
+`SSH_OPTIONS` passes anything else ssh needs. It is worth knowing about: on a
+machine whose system-wide `ssh_config` sets a non-default `Port` under
+`Host *`, an ordinary `ssh github.com` quietly dials that port and hangs until
+it times out.
 
 If that separate account exists only to receive backups, GitHub asks that it be
 a *machine account*: their terms allow one free personal account plus one free

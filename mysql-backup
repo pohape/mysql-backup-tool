@@ -50,6 +50,7 @@ REMOTE_URL=             # where it is pushed; `init` wires this up
 REMOTE=origin
 BRANCH=
 SSH_KEY=                # a dedicated deploy key, configured in the repository
+SSH_OPTIONS=            # extra ssh options, e.g. "-p 22" or a ProxyCommand
 PUSH_RETRIES=3
 
 # --- layout ----------------------------------------------------------------
@@ -589,7 +590,15 @@ git_setup() {
     # A key named in the repository, rather than a host alias in ~/.ssh/config,
     # keeps the deployment self-contained: nothing outside this directory has
     # to be edited for the push to work.
-    [ -z "$SSH_KEY" ] || git_in_repo config core.sshCommand "ssh -i '$SSH_KEY' -o IdentitiesOnly=yes"
+    # SSH_OPTIONS covers what the host's ssh_config would otherwise decide for
+    # us. On a machine whose system-wide config sets a non-default Port for
+    # `Host *`, a plain `ssh github.com` dials that port and hangs; the aliases
+    # in ~/.ssh/config escape it by naming Port 22 explicitly, and a command
+    # built here has to be able to do the same.
+    if [ -n "$SSH_KEY" ] || [ -n "$SSH_OPTIONS" ]; then
+        git_in_repo config core.sshCommand \
+            "ssh${SSH_KEY:+ -i '$SSH_KEY' -o IdentitiesOnly=yes}${SSH_OPTIONS:+ $SSH_OPTIONS}"
+    fi
 }
 
 # git_preflight — refuse to start unless the repository can actually be written.
