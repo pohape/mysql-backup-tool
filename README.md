@@ -205,7 +205,7 @@ This is not a marginal effect. In the incident that motivated the feature,
 | `backup` | Dump, commit, push. The cron entry point. |
 | `verify` | Dump twice, prove the output is identical. |
 | `check-fresh` | Report time since the last success; non-zero when overdue. |
-| `doctor` | Config, connectivity, repository and remote health. |
+| `doctor` | Everything that has to be true for tonight's backup to work. |
 | `gc` | Repack now, ignoring the threshold. |
 
 Options: `--no-skip` re-dumps every partition; `--dry-run` writes the files but
@@ -219,6 +219,57 @@ rather than guessing that you meant it.
 Exit codes: `0` success (also "already running" and "nothing changed"),
 `1` failure, `2` configuration error, `3` a dump failed validation,
 `4` freshness deadline missed.
+
+## Checking it before you trust it
+
+`doctor` answers one question: will `backup` work when cron runs it tonight? It
+exits non-zero if anything would stop it, so it can be run from a script.
+
+```
+$ ./mysql-backup doctor myapp.conf
+
+environment
+  ok    tools                  git, flock, timeout, awk
+configuration
+  ok    connection             docker exec myapp-db
+  ok    credentials            container
+  ok    table mode             exclude
+  ok    freshness              1d 0h
+repository
+  ok    state                  writable, on branch main
+  ok    remote read            git@github.com:you/myapp-backup.git
+  ok    remote write           accepted
+  ok    remote sync            in sync
+database
+  ok    connection             myapp
+  ok    dump binary            mariadb-dump from 11.4.12-MariaDB
+  ok    tables                 41
+  ok    named tables           all exist
+dumping
+  ok    schema dump            33644 bytes
+  ok    partition job_results  318 partition(s) into data/jobs/
+history
+  ok    last success           6h 12m ago
+
+All checks passed.
+```
+
+Some of these are there because passing the obvious checks is not the same as
+working:
+
+- **remote write** does a `push --dry-run`. `ls-remote` only proves *read*
+  access, and a deploy key added without write permission passes every other
+  check and then fails at the first real push — which on a nightly job means
+  tomorrow.
+- **named tables** verifies that every table named in the config actually
+  exists. A typo is otherwise silent, and silence here means a table you
+  believe is excluded is being backed up, or one you believe is protected is
+  not.
+- **partition** runs each `--list` and `--stable` query, checks the names can
+  be filenames, and checks that no two rows produce the same one. Those queries
+  are otherwise only ever executed by `backup`, at four in the morning.
+- **schema dump** performs a real dump with the configured flags, so missing
+  privileges surface now rather than during the first backup.
 
 ## Monitor it, or it will fail silently
 

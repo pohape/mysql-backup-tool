@@ -1033,88 +1033,179 @@ cmd_check_fresh() {
     fi
 }
 
+DOCTOR_FAILED=0
+ck_ok()   { printf '  ok    %-22s %s\n' "$1" "${2:-}"; }
+ck_warn() { printf '  warn  %-22s %s\n' "$1" "${2:-}"; }
+ck_fail() { printf '  FAIL  %-22s %s\n' "$1" "${2:-}"; DOCTOR_FAILED=1; }
+
+# doctor — answer one question: will `backup` work when cron runs it tonight?
+#
+# Every check here corresponds to a way a backup has actually been found broken
+# only after it mattered.
 cmd_doctor() {
-    printf 'tool          %s\n' "$VERSION"
-    printf 'connection    %s\n' "$([ "$BACKEND" = native ] && printf 'local client' || printf 'docker exec %s' "$DB_CONTAINER")"
-    printf 'credentials   %s\n' "$CREDS"
-    printf 'repository    %s\n' "$REPO"
+    printf 'mysql-backup %s\n\n' "$VERSION"
 
-    git_setup
-    git_preflight
-    printf 'repository    ok, on branch %s\n' "$(git_current_branch)"
-
-    if db_query "SELECT 1" >/dev/null 2>&1; then
-        resolve_database
-        printf 'database      %s, %s tables\n' "$DB_NAME" "$(db_tables | grep -c . || true)"
-    else
-        printf 'database      UNREACHABLE\n'
+    printf 'environment\n'
+    local t missing=""
+    for t in git flock timeout awk mktemp find diff; do
+        command -v "$t" >/dev/null 2>&1 || missing+=" $t"
+    done
+    [ -z "$missing" ] && ck_ok "tools" "git, flock, timeout, awk" \
+                      || ck_fail "tools" "missing:$missing"
+    if [ "$BACKEND" != native ]; then
+        command -v docker >/dev/null 2>&1 && ck_ok "docker" "client present" \
+                                          || ck_fail "docker" "the docker client is not on PATH"
     fi
 
-    printf 'loose objects %s (packed at %s)\n' "$(git_loose_count)" "$GC_LOOSE_LIMIT"
+    printf '\nconfiguration\n'
+    ck_ok "connection" "$([ "$BACKEND" = native ] && printf 'local client %s:%s' "$DB_HOST" "$DB_PORT" || printf 'docker exec %s' "$DB_CONTAINER")"
+    ck_ok "credentials" "$CREDS"
+    ck_ok "table mode" "$TABLE_MODE"
+    [ -n "$FRESHNESS" ] && ck_ok "freshness" "$(human_duration "$FRESHNESS")" \
+                        || ck_warn "freshness" "not set — check-fresh cannot be used, so a dead backup goes unnoticed"
+
+    printf '\nrepository\n'
+    local msg
+    if msg=$( { git_setup && git_preflight; } 2>&1 ); then
+        ck_ok "state" "writable, on branch $(git_current_branch)"
+    else
+        ck_fail "state" "${msg##*FATAL }"
+        printf '\nStop here: nothing else can be checked until the repository works.\n'
+        return 1
+    fi
 
     local branch here there
     branch=${BRANCH:-$(git_current_branch)}
     here=$(git_head_sha)
-    there=$(git_in_repo ls-remote "$REMOTE" "refs/heads/$branch" 2>/dev/null | cut -f1 || printf '')
-    if [ -z "$here" ]; then printf 'remote        no commits yet\n'
-    elif [ "$here" = "$there" ]; then printf 'remote        in sync\n'
-    else printf 'remote        OUT OF SYNC (local %s, remote %s)\n' "${here:0:8}" "${there:0:8}"
+
+    if [ -z "$REMOTE_URL" ] && ! git_in_repo remote get-url "$REMOTE" >/dev/null 2>&1; then
+        ck_fail "remote" "none configured — the backup would never leave this machine"
+    elif ! there=$(git_in_repo ls-remote "$REMOTE" "refs/heads/$branch" 2>&1); then
+        ck_fail "remote read" "${there%%$'\n'*}"
+    else
+        ck_ok "remote read" "$(git_in_repo remote get-url "$REMOTE")"
+        there=$(printf '%s' "$there" | cut -f1)
+
+        # Read access is not write access. A deploy key added without write
+        # permission passes every other check and fails at the first push.
+        if [ -z "$here" ]; then
+            ck_warn "remote write" "no commits yet — run init, then check again"
+        elif msg=$(git_in_repo push --dry-run "$REMOTE" "HEAD:refs/heads/$branch" 2>&1); then
+            ck_ok "remote write" "accepted"
+        else
+            ck_fail "remote write" "${msg##*$'\n'}"
+        fi
+
+        if [ -z "$here" ]; then ck_ok "remote sync" "no commits yet"
+        elif [ "$here" = "$there" ]; then ck_ok "remote sync" "in sync"
+        else ck_warn "remote sync" "local ${here:0:8}, remote ${there:0:8} — the next backup will push"
+        fi
     fi
 
+    ck_ok "loose objects" "$(git_loose_count) (packed at $GC_LOOSE_LIMIT)"
+
+    printf '\ndatabase\n'
+    if ! db_query "SELECT 1" >/dev/null 2>&1; then
+        ck_fail "connection" "cannot reach the database"
+        printf '\nStop here: the rest depends on the connection.\n'
+        return 1
+    fi
+    resolve_database
+    ck_ok "connection" "$DB_NAME"
+
+    if msg=$(_run_client "$DUMP_BIN" --version 2>&1); then
+        ck_ok "dump binary" "$(printf '%s' "$msg" | head -1 | cut -c1-60)"
+    else
+        ck_fail "dump binary" "$DUMP_BIN not usable: ${msg##*$'\n'}"
+    fi
+
+    local tables
+    tables=$(db_tables) || tables=""
+    [ -n "$tables" ] && ck_ok "tables" "$(printf '%s\n' "$tables" | grep -c .)" \
+                     || ck_fail "tables" "the database reports none — wrong database, or grants hide them"
+
+    # A typo in a table name is silent: a table you believe is excluded is
+    # being backed up, or one you believe is protected is not.
+    classify_tables
+    local x unknown=""
+    for x in "${!EXCLUDED[@]}" "${!SCHEMA_ONLY[@]}" "${!INCLUDED[@]}"; do
+        printf '%s\n' "$tables" | grep -qxF "$x" || unknown+=" $x"
+    done
+    [ -z "$unknown" ] && ck_ok "named tables" "all exist" \
+                      || ck_fail "named tables" "not in the database:$unknown"
+
+    printf '\ndumping\n'
+    prepare_workspace
+    local tmp; tmp=$(mktemp "$WORK_TMP/probe.XXXXXX")
+    local -a sargs=(--no-data --routines --triggers)
+    [ "$DUMP_EVENTS" = 1 ] && sargs+=(--events)
+    if db_dump "${sargs[@]}" > "$tmp" 2>"$tmp.err"; then
+        if validate_dump "$tmp" any 2>/dev/null; then
+            ck_ok "schema dump" "$(wc -c < "$tmp") bytes"
+        else
+            ck_fail "schema dump" "produced an incomplete dump"
+        fi
+    else
+        ck_fail "schema dump" "$(head -1 "$tmp.err" 2>/dev/null)${DUMP_EVENTS:+ (try DUMP_EVENTS=0 if the user lacks the EVENT privilege)}"
+    fi
+    rm -f "$tmp" "$tmp.err"
+
+    check_partitions
+    rm -rf "$WORK_TMP"
+
+    printf '\nhistory\n'
     local age rc=0
     age=$(seconds_since_success) || rc=$?
     case $rc in
-        0) printf 'last success  %s ago\n' "$(human_duration "$age")" ;;
-        1) printf 'last success  never recorded\n' ;;
-        2) printf 'last success  marker unreadable\n' ;;
+        0) ck_ok   "last success" "$(human_duration "$age") ago" ;;
+        1) ck_warn "last success" "never recorded" ;;
+        2) ck_fail "last success" "the marker file is unreadable" ;;
     esac
+
+    printf '\n'
+    if [ "$DOCTOR_FAILED" -eq 0 ]; then
+        printf 'All checks passed.\n'
+        return 0
+    fi
+    printf 'Some checks failed. Fix them before relying on this backup.\n'
+    return 1
 }
 
-# init — create and wire up the backup repository.
-#
-# Doing this by hand is four commands that must all be right, repeated once per
-# database. Getting the branch or the key wrong is not noticed until the first
-# push fails, which on a nightly job means tomorrow.
-cmd_init() {
-    local branch=${BRANCH:-main}
-
-    if [ -d "$REPO/.git" ]; then
-        log "repository already exists: $REPO"
-    else
-        mkdir -p "$REPO"
-        git init -q "$REPO"
-        log "created repository $REPO"
-    fi
-
-    # Set the branch name before the first commit, so the repository starts on
-    # the branch the config asks for instead of whatever git defaults to.
-    if [ -z "$(git_head_sha)" ]; then
-        git_in_repo symbolic-ref HEAD "refs/heads/$branch"
-        log "branch $branch"
-    fi
-
-    git_setup
-    [ -z "$SSH_KEY" ] || log "deploy key $SSH_KEY"
-
-    if [ -n "$REMOTE_URL" ]; then
-        if git_in_repo remote get-url "$REMOTE" >/dev/null 2>&1; then
-            git_in_repo remote set-url "$REMOTE" "$REMOTE_URL"
-        else
-            git_in_repo remote add "$REMOTE" "$REMOTE_URL"
+# The partition queries are only ever run by `backup`, so a typo in one of them
+# is discovered at 4am. Run them here, and check their names can be filenames.
+check_partitions() {
+    [ "${#PART_TABLE[@]}" -gt 0 ] || return 0
+    local i table rows n kval name bad dup
+    local -A seen=()
+    for i in "${!PART_TABLE[@]}"; do
+        table=${PART_TABLE[$i]}
+        if ! rows=$(db_query "${PART_LIST[$i]}" 2>&1); then
+            ck_fail "partition $table" "the --list query failed: ${rows##*$'\n'}"
+            continue
         fi
-        log "remote $REMOTE -> $REMOTE_URL"
-        if git_in_repo ls-remote "$REMOTE" >/dev/null 2>&1; then
-            log "remote is reachable"
-        else
-            warn "the remote is not reachable yet. If it is a deploy key, check it has write access."
+        if [ -n "${PART_STABLE[$i]}" ] && ! db_query "${PART_STABLE[$i]}" >/dev/null 2>&1; then
+            ck_fail "partition $table" "the --stable query failed"
+            continue
         fi
-    elif ! git_in_repo remote get-url "$REMOTE" >/dev/null 2>&1; then
-        warn "no remote configured. Set REMOTE_URL in the config and run init again,"
-        warn "or the backup will never leave this machine."
-    fi
+        n=0; bad=""; dup=""
+        while IFS=$'\t' read -r kval name; do
+            [ -n "$kval" ] && [ "$kval" != NULL ] || continue
+            [ -n "${name:-}" ] || name=$kval
+            n=$(( n + 1 ))
+            if ! sanitise_name "$name" >/dev/null; then bad=$name; break; fi
+            local key="${PART_DIR[$i]}/$name"
+            [ -z "${seen[$key]:-}" ] || dup=$name
+            seen[$key]=1
+        done <<< "$rows"
 
-    ensure_dirs "$REPO"
-    log "ready — run 'mysql-backup doctor' next, then 'backup'"
+        if [ -n "$bad" ]; then
+            ck_fail "partition $table" "the name '$bad' cannot be a filename; sanitise it in the --list query"
+        elif [ -n "$dup" ]; then
+            ck_fail "partition $table" "two rows both produce the file '$dup.sql'"
+        else
+            ck_ok "partition $table" "$n partition(s) into ${PART_DIR[$i]}/"
+        fi
+    done
 }
 
 cmd_gc() {
