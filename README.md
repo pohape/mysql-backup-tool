@@ -48,8 +48,11 @@ its own: everything specific to a database lives in that database's config
 file, and everything specific to a backup lives in that backup's repository.
 Several databases on one machine share one copy of the tool.
 
+Put it wherever your other checkouts live — the tool never looks at its own
+location, and every path it touches comes from the config.
+
 ```
-~/mysql-backup-tool/          one clone, all databases
+~/GitHub/mysql-backup-tool/   one clone, all databases
 ~/backup-configs/shop.conf    one config per database
 ~/backup-configs/crm.conf
 ~/backups/shop/               one repository per database
@@ -57,9 +60,9 @@ Several databases on one machine share one copy of the tool.
 ```
 
 ```cron
-17 4 * * * ~/mysql-backup-tool/mysql-backup backup ~/backup-configs/shop.conf >> ~/logs/shop-backup.log 2>&1
-23 4 * * * ~/mysql-backup-tool/mysql-backup backup ~/backup-configs/crm.conf  >> ~/logs/crm-backup.log  2>&1
- 0 */6 * * * ~/mysql-backup-tool/mysql-backup check-fresh ~/backup-configs/shop.conf
+17 4 * * *  ~/GitHub/mysql-backup-tool/mysql-backup backup      ~/backup-configs/shop.conf >> ~/logs/shop-backup.log 2>&1
+23 4 * * *  ~/GitHub/mysql-backup-tool/mysql-backup backup      ~/backup-configs/crm.conf  >> ~/logs/crm-backup.log  2>&1
+ 0 */6 * * * ~/GitHub/mysql-backup-tool/mysql-backup check-fresh ~/backup-configs/shop.conf
 ```
 
 Give each database its own remote repository. Sharing one between two databases
