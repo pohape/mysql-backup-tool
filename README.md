@@ -235,7 +235,7 @@ This is not a marginal effect. In the incident that motivated the feature,
 |---|---|
 | `backup` | Dump, commit, push. The cron entry point. |
 | `verify` | Dump twice, prove the output is identical. |
-| `check-fresh` | Report time since the last success; non-zero when overdue. |
+| `status` | One line for monitoring: it ran, and it reached the remote. |
 | `doctor` | Everything that has to be true for tonight's backup to work. |
 | `gc` | Repack now, ignoring the threshold. |
 
@@ -318,16 +318,54 @@ repository, is not detached, and that its reflog is *actually writable* — by
 writing to it. That specific check turns those two and a half months into one
 loud error on the first run.
 
-**A deadman switch.** Every successful run records a timestamp.
-`check-fresh` compares it against `freshness` and exits non-zero when the
-deadline passes, printing `FRESH` or `STALE`:
+**A deadman switch.** Every successful run records a timestamp, and `status`
+prints one line saying whether the backup is healthy:
 
-```cron
-0 */6 * * * /path/to/mysql-backup check-fresh /path/to/myapp.conf
+```
+$ ./mysql-backup status myapp.conf
+BACKUP OK: last run 42m ago, pushed to origin/main
 ```
 
-It measures the last successful *run*, not the last commit — a database that
+It checks two things, because freshness alone is not enough. A run can dump,
+validate and commit perfectly and still fail to push — and then the backup
+exists only on the machine it is meant to protect, while every freshness check
+says all is well. So `status` also confirms the local branch matches the
+remote:
+
+```
+BACKUP PROBLEM: 3 commit(s) not pushed to origin/main — the backup has not left this machine
+BACKUP PROBLEM: last successful run 3d 4h ago, limit 1d 0h
+BACKUP PROBLEM: no successful run has ever been recorded
+```
+
+It measures the last successful *run*, not the last commit: a database that
 legitimately did not change must not look like a broken backup.
+
+### Wiring it into a monitor
+
+`status` exits non-zero on a problem and prints a single line, so it works with
+anything that runs a command. With
+[self-hosted-tg-alerts-uptime-monitor](https://github.com/pohape/self-hosted-tg-alerts-uptime-monitor)
+— a small YAML-configured checker that sends Telegram alerts — add:
+
+```yaml
+  myapp_backup:
+    command: "/home/user/GitHub/mysql-backup-tool/mysql-backup status /home/user/GitHub/myapp/backup.conf"
+    search_string: "BACKUP OK"
+    schedule: "0 */6 * * *"
+    notify_after_attempt: 2
+    timeout: 60
+    tg_chats_to_notify:
+      - 123456789
+```
+
+`notify_after_attempt: 2` keeps a momentary network failure from paging you:
+an unreachable remote is a problem worth knowing about, but not on the first
+try. Or from plain cron, relying on the exit code:
+
+```cron
+0 */6 * * * /path/to/mysql-backup status /path/to/myapp.conf || mail -s "backup problem" you@example.com
+```
 
 ## Restoring
 

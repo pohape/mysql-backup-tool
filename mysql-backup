@@ -999,38 +999,49 @@ cmd_verify() {
     return "$EX_VALIDATION"
 }
 
-cmd_check_fresh() {
+# status — one line for a monitoring system, and the exit code to match.
+#
+# Freshness alone is not enough. A run can dump, validate and commit perfectly
+# and still fail to push, and then the backup exists only on the machine it is
+# supposed to protect — while every freshness check says everything is fine.
+# So this reports both: that the tool ran, and that the result left the box.
+cmd_status() {
     [ -n "$FRESHNESS" ] || \
-        die "$EX_CONFIG" "check-fresh needs a deadline: set FRESHNESS in the config"
-    git_in_repo rev-parse --git-dir >/dev/null 2>&1 || \
-        die "$EX_CONFIG" "not a git repository: $REPO"
+        die "$EX_CONFIG" "status needs a deadline: set FRESHNESS in the config"
+
+    problem() { printf 'BACKUP PROBLEM: %s\n' "$1"; exit "$EX_STALE"; }
+
+    git_in_repo rev-parse --git-dir >/dev/null 2>&1 || problem "not a git repository: $REPO"
 
     local age rc=0
     age=$(seconds_since_success) || rc=$?
     case $rc in
-        1) printf 'STALE: no successful backup has ever been recorded\n'
-           notify "backup of $REPO has never succeeded"; exit "$EX_STALE" ;;
-        2) printf 'STALE: the last-success marker is unreadable\n'
-           notify "backup of $REPO has an unreadable state file"; exit "$EX_STALE" ;;
+        1) problem "no successful run has ever been recorded" ;;
+        2) problem "the last-success marker is unreadable" ;;
     esac
+    [ "$age" -le "$FRESHNESS" ] || \
+        problem "last successful run $(human_duration "$age") ago, limit $(human_duration "$FRESHNESS")"
 
-    if [ "$age" -gt "$FRESHNESS" ]; then
-        printf 'STALE: last successful run %s ago, limit %s\n' \
-            "$(human_duration "$age")" "$(human_duration "$FRESHNESS")"
-        notify "backup of $REPO is stale: $(human_duration "$age") since the last success"
-        exit "$EX_STALE"
+    local branch here there
+    branch=${BRANCH:-$(git_current_branch)}
+    here=$(git_head_sha)
+    [ -n "$here" ] || problem "the repository has no commits"
+
+    if ! there=$(git_in_repo ls-remote "$REMOTE" "refs/heads/$branch" 2>&1); then
+        # Collapsed onto one line: the alert has to be readable in a chat
+        # message, and ssh spreads its explanation over three lines.
+        problem "cannot reach $REMOTE: $(printf '%s' "$there" | tr '\n' ' ' | sed 's/  */ /g')"
+    fi
+    there=$(printf '%s' "$there" | cut -f1)
+
+    if [ "$here" != "$there" ]; then
+        local behind
+        behind=$(git_in_repo rev-list --count "${there:-}..HEAD" 2>/dev/null || printf '?')
+        problem "$behind commit(s) not pushed to $REMOTE/$branch — the backup has not left this machine"
     fi
 
-    # The commit age is reported for context only. It is not a health signal: a
-    # database that legitimately did not change produces no commit, and that is
-    # not a broken backup.
-    local cage
-    if cage=$(git_commit_age); then
-        printf 'FRESH: last successful run %s ago, newest data %s old\n' \
-            "$(human_duration "$age")" "$(human_duration "$cage")"
-    else
-        printf 'FRESH: last successful run %s ago\n' "$(human_duration "$age")"
-    fi
+    printf 'BACKUP OK: last run %s ago, pushed to %s/%s\n' \
+        "$(human_duration "$age")" "$REMOTE" "$branch"
 }
 
 DOCTOR_FAILED=0
@@ -1226,8 +1237,8 @@ COMMANDS
     backup       Dump, commit and push. The normal cron entry point.
     verify       Dump twice and prove the output is identical. Determinism is
                  what keeps the repository small; this is how you check it.
-    check-fresh  Report time since the last successful run; exits non-zero once
-                 FRESHNESS has passed. Point your monitoring at this.
+    status       One line for a monitoring system: that the backup ran, and
+                 that it reached the remote. Exits non-zero when it did not.
     doctor       Configuration, connectivity and repository health.
     gc           Repack the repository now.
     help         This text.
@@ -1240,7 +1251,7 @@ OPTIONS
 EXIT CODES
     0  success (also: another run holds the lock, or nothing changed)
     1  failure          3  a dump failed validation
-    2  bad config       4  freshness deadline missed (check-fresh)
+    2  bad config       4  the backup is not healthy (status)
 TXT
 }
 
@@ -1276,7 +1287,7 @@ main() {
         init)        cmd_init ;;
         backup)      cmd_backup ;;
         verify)      cmd_verify ;;
-        check-fresh) cmd_check_fresh ;;
+        status)      cmd_status ;;
         doctor)      cmd_doctor ;;
         gc)          cmd_gc ;;
         *) usage >&2; die "$EX_CONFIG" "unknown command '$command'" ;;
