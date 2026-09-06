@@ -1,0 +1,10 @@
+# Local, machine-specific configuration — never commit these.
+# Each deployment keeps its own config outside version control.
+*.conf
+!examples/*.conf
+.env
+*.log
+
+# Backup working directories, if placed inside the checkout.
+/repos/
+/tmp/
