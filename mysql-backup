@@ -327,8 +327,10 @@ validate_config() {
 # readable by every user on the host through `ps` — and that includes the
 # arguments of `docker exec`, not only those of mysqldump.
 #
-#   native                       an environment variable of the dump process
-#   container                    handed over stdin to a shell in the container
+#   native                         an environment variable of the dump process
+#   container                      passed to `docker exec -e MYSQL_PWD`, which
+#                                  takes the value from this process's
+#                                  environment and puts only the NAME in argv
 #   container, CREDS_IN_CONTAINER  never leaves the container at all
 
 # Flags every dump gets. The first three are about consistency and memory; the
@@ -342,7 +344,14 @@ DUMP_DEFAULTS=(
 
 _shq() { local s=${1//\'/\'\\\'\'}; printf "'%s'" "$s"; }
 
-_container_exec() { docker exec -i "$DB_CONTAINER" "$@"; }
+# No -i: nothing here reads standard input, so there is no reason to attach it.
+_container_exec() {
+    if [ "$CREDS" = container ]; then
+        docker exec "$DB_CONTAINER" "$@"
+    else
+        MYSQL_PWD="$DB_PASSWORD" docker exec -e MYSQL_PWD "$DB_CONTAINER" "$@"
+    fi
+}
 
 # _run_client <binary> <args...> — @DB@ is replaced by the database name.
 _run_client() {
@@ -359,17 +368,15 @@ _run_client() {
         return
     fi
 
-    local dbexpr uexpr auth via_stdin
+    local dbexpr uexpr auth
     if [ "$CREDS" = container ]; then
         dbexpr="\"\$${CONTAINER_DATABASE_VAR}\""
         uexpr="\"\$${CONTAINER_USER_VAR}\""
         auth="export MYSQL_PWD=\"\$${CONTAINER_PASSWORD_VAR}\"; "
-        via_stdin=0
     else
         dbexpr=$(_shq "$DB_NAME")
         uexpr=$(_shq "$DB_USER")
-        auth='IFS= read -r MYSQL_PWD; export MYSQL_PWD; '
-        via_stdin=1
+        auth=''   # MYSQL_PWD arrives through `docker exec -e`
     fi
 
     # The timeout has to live inside the container. A `timeout` around
@@ -381,14 +388,7 @@ _run_client() {
         if [ "$x" = "@DB@" ]; then cmd+=" $dbexpr"; else cmd+=" $(_shq "$x")"; fi
     done
 
-    if [ "$via_stdin" -eq 1 ]; then
-        printf '%s\n' "$DB_PASSWORD" | _container_exec sh -c "$cmd"
-    else
-        # stdin is closed explicitly: `docker exec -i` inherits it, and a run
-        # started from a script would otherwise have the rest of that script
-        # eaten by the container.
-        _container_exec sh -c "$cmd" < /dev/null
-    fi
+    _container_exec sh -c "$cmd" < /dev/null
 }
 
 db_query() { _run_client "$CLIENT_BIN" -N -B -e "$1" @DB@; }
@@ -482,9 +482,14 @@ validate_dump() {
 
     # Only the tail is examined, so a table storing SQL text cannot make a
     # truncated dump look complete by containing the marker in its data.
-    # -e is load-bearing: the marker starts with "--" and grep would otherwise
-    # read it as its own options and match everything.
-    if ! tail -c 2048 "$file" | grep -qF -e "$DUMP_END_MARKER"; then
+    #
+    # Matched with `case`, not `tail | grep -q`. Under `set -o pipefail` that
+    # pipeline reports failure whenever grep exits on its first match before
+    # tail has finished writing: tail dies of SIGPIPE, and a valid dump is
+    # rejected at random. The same shape caused a table listing to lose a
+    # different table on roughly one run in ten.
+    local tail_bytes; tail_bytes=$(tail -c 2048 "$file")
+    if [ "${tail_bytes#*"$DUMP_END_MARKER"}" = "$tail_bytes" ]; then
         warn "dump is truncated (no end marker): $file"
         return 1
     fi
@@ -663,7 +668,7 @@ git_commit() {
     local stat; stat=$(git_in_repo diff --cached --shortstat | sed 's/^ *//')
     # The date is already in the commit metadata; repeating it in the subject
     # wastes the one line that could say what actually changed.
-    git_in_repo commit -q -m "sync: $stat" || return 1
+    git_in_repo commit -q -m "$stat" || return 1
     log "committed: $stat"
 }
 
@@ -688,12 +693,15 @@ git_push() {
             return 1
         fi
 
-        if printf '%s' "$out" | grep -qiE 'non-fast-forward|fetch first|rejected'; then
+        shopt -s nocasematch
+        if [[ $out == *non-fast-forward* || $out == *"fetch first"* || $out == *rejected* ]]; then
+            shopt -u nocasematch
             warn "push rejected: the remote has commits this repository does not have."
             warn "Resolve it by hand — this tool never force-pushes, because that is how backups get destroyed."
             printf '%s\n' "$out" >&2
             return 1
         fi
+        shopt -u nocasematch
 
         warn "push attempt $attempt/$PUSH_RETRIES failed, retrying in ${delay}s"
         sleep "$delay"; attempt=$(( attempt + 1 )); delay=$(( delay * 2 ))
@@ -1136,7 +1144,7 @@ cmd_doctor() {
     ck_ok "connection" "$DB_NAME"
 
     if msg=$(_run_client "$DUMP_BIN" --version 2>&1); then
-        ck_ok "dump binary" "$(printf '%s' "$msg" | head -1 | cut -c1-60)"
+        ck_ok "dump binary" "$(printf '%.60s' "${msg%%$'\n'*}")"
     else
         ck_fail "dump binary" "$DUMP_BIN not usable: ${msg##*$'\n'}"
     fi
@@ -1149,9 +1157,12 @@ cmd_doctor() {
     # A typo in a table name is silent: a table you believe is excluded is
     # being backed up, or one you believe is protected is not.
     classify_tables
+    local -A present=()
+    local t
+    while IFS= read -r t; do [ -z "$t" ] || present[$t]=1; done <<< "$tables"
     local x unknown=""
     for x in "${!EXCLUDED[@]}" "${!SCHEMA_ONLY[@]}" "${!INCLUDED[@]}"; do
-        printf '%s\n' "$tables" | grep -qxF "$x" || unknown+=" $x"
+        [ -n "${present[$x]:-}" ] || unknown+=" $x"
     done
     [ -z "$unknown" ] && ck_ok "named tables" "all exist" \
                       || ck_fail "named tables" "not in the database:$unknown"
@@ -1276,7 +1287,7 @@ cmd_init() {
     # An empty first commit gives `push --dry-run` something to negotiate, so
     # doctor can prove write access before the first real backup exists.
     if [ -z "$(git_head_sha)" ]; then
-        git_in_repo commit -q --allow-empty -m "sync: initialise repository"
+        git_in_repo commit -q --allow-empty -m "initialise repository"
         log "created the initial commit"
     fi
 
