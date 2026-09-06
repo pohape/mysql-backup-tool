@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+#
+# mysql-backup — back up a MySQL or MariaDB database into a git repository,
+# storing each run as a diff rather than as another full copy.
+#
+# See README.md for the reasoning. Run `mysql-backup help` for usage.
+
+set -euo pipefail
+
+TOOL_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=lib/log.sh
+. "$TOOL_ROOT/lib/log.sh"
+# shellcheck source=lib/config.sh
+. "$TOOL_ROOT/lib/config.sh"
+# shellcheck source=lib/db.sh
+. "$TOOL_ROOT/lib/db.sh"
+# shellcheck source=lib/dump.sh
+. "$TOOL_ROOT/lib/dump.sh"
+# shellcheck source=lib/git.sh
+. "$TOOL_ROOT/lib/git.sh"
+
+VERSION="1.0.0"
+OPT_NO_SKIP=0
+OPT_DRY_RUN=0
+
+usage() {
+    cat <<'TXT'
+mysql-backup — MySQL/MariaDB backups as a git history
+
+USAGE
+    mysql-backup <command> <config> [options]
+
+COMMANDS
+    backup       Dump, commit and push. The normal cron entry point.
+    verify       Dump everything twice and prove the output is identical.
+                 Determinism is what keeps the repository small; this checks it.
+    check-fresh  Report how long since the last successful run. Exits non-zero
+                 when the deadline set by `freshness` has passed. For monitoring.
+    doctor       Check configuration, connectivity and repository health.
+    gc           Repack the repository now, ignoring the loose-object threshold.
+    help         This text.
+
+OPTIONS
+    --no-skip    Re-dump every partition, including ones marked stable.
+    --dry-run    Produce the files but do not commit or push.
+
+EXIT CODES
+    0  success (also: another run holds the lock, or nothing changed)
+    1  failure
+    2  configuration error
+    3  a dump failed validation
+    4  freshness deadline missed (check-fresh)
+TXT
+}
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+state_file() {
+    printf '%s/mysql-backup-last-success' "$(git_in_repo rev-parse --absolute-git-dir)"
+}
+
+mark_success() {
+    date +%s > "$(state_file)"
+}
+
+# A cron job that can overrun its interval must not run twice at once. Exiting
+# quietly with success is correct: the next tick will do the work.
+acquire_lock() {
+    local lock
+    lock="$(git_in_repo rev-parse --absolute-git-dir)/mysql-backup.lock"
+    exec 9>"$lock"
+    if ! flock -n 9; then
+        log "another run holds the lock; exiting"
+        exit "$EX_OK"
+    fi
+}
+
+human_duration() {
+    local s=$1
+    if   [ "$s" -lt 60 ];   then printf '%ds' "$s"
+    elif [ "$s" -lt 3600 ]; then printf '%dm' $(( s / 60 ))
+    elif [ "$s" -lt 86400 ];then printf '%dh %dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+    else                         printf '%dd %dh' $(( s / 86400 )) $(( s % 86400 / 3600 ))
+    fi
+}
+
+# resolve_database — learn the database name when only the container knows it.
+#
+# In container_env mode the credentials never leave the container, so the host
+# does not know which database it is backing up. The name itself is not a
+# secret, and several operations (--ignore-table, logging) need it.
+resolve_database() {
+    [ -n "$CFG_DB" ] && return 0
+    CFG_DB=$(db_query "SELECT DATABASE()")
+    [ -n "$CFG_DB" ] && [ "$CFG_DB" != NULL ] || \
+        die "$EX_CONFIG" "no default database for this connection; set it with database <name>"
+}
+
+# ---------------------------------------------------------------------------
+# producing the file tree
+# ---------------------------------------------------------------------------
+
+# Shared by `backup` and `verify` so the two can never drift apart: verifying
+# something other than what is backed up would prove nothing.
+# Runs relative to the current directory.
+produce_all_dumps() {
+    local -A excluded=() schema_only=() partitioned=()
+    local t spec table dir
+
+    local x
+    for x in ${CFG_TABLES_EXCLUDE[@]+"${CFG_TABLES_EXCLUDE[@]}"}; do excluded[$x]=1; done
+    for x in ${CFG_TABLES_SCHEMA[@]+"${CFG_TABLES_SCHEMA[@]}"};  do schema_only[$x]=1; done
+    for spec in ${CFG_PARTITIONS[@]+"${CFG_PARTITIONS[@]}"}; do
+        IFS="$FS" read -r table dir _ _ _ <<< "$spec"
+        partitioned[$table]=1
+    done
+
+    # Contradictory classification would produce a backup whose schema omits a
+    # table while its data files are present — restorable only by hand.
+    local p
+    for p in "${!partitioned[@]}"; do
+        [ -z "${excluded[$p]:-}" ] || die "$EX_CONFIG" \
+            "table '$p' is both excluded and partitioned; its data would be dumped without its schema"
+        [ -z "${schema_only[$p]:-}" ] || die "$EX_CONFIG" \
+            "table '$p' is both schema-only and partitioned; these ask for opposite things"
+    done
+
+    dump_schema excluded
+    dump_flat_tables excluded schema_only partitioned
+    dump_partitions
+}
+
+# The schema is dumped as one file for the whole database rather than per
+# table: routines, triggers and views are database-wide, and mysqldump only
+# emits them when it is given a database instead of a table list.
+dump_schema() {
+    local -n _excluded=$1
+    local -a ignore=()
+    local t
+    for t in "${!_excluded[@]}"; do
+        ignore+=("--ignore-table=${CFG_DB}.${t}")
+    done
+
+    dump_to "$CFG_SCHEMA_FILE" "$DUMP_COMPLETE_MARKER" \
+        --no-data --routines --triggers ${ignore[@]+"${ignore[@]}"} \
+        || die "$EX_VALIDATION" "schema dump failed"
+}
+
+dump_flat_tables() {
+    local -n _excluded=$1 _schema_only=$2 _partitioned=$3
+    local t safe tables
+
+    # Captured before the loop rather than read from a process substitution:
+    # a pipeline that fails inside `while read` is invisible, and the loop
+    # would simply see no tables. Combined with orphan removal, that turns a
+    # transient database error into a committed deletion of the whole backup.
+    tables=$(db_tables) || die "$EX_FAIL" "could not list tables"
+
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        [ -z "${_excluded[$t]:-}" ]    || continue
+        [ -z "${_schema_only[$t]:-}" ] || continue
+        [ -z "${_partitioned[$t]:-}" ] || continue
+
+        safe=$(sanitise_name "$t") || \
+            die "$EX_CONFIG" "table name '$t' cannot be used as a filename; exclude it explicitly"
+
+        dump_to "$CFG_DATA_DIR/${safe}.sql" "$DUMP_COMPLETE_MARKER" \
+            --no-create-info -- "$t" \
+            || die "$EX_VALIDATION" "dump of table '$t' failed"
+    done <<< "$tables"
+}
+
+dump_partitions() {
+    local spec table dir list key stable
+    for spec in ${CFG_PARTITIONS[@]+"${CFG_PARTITIONS[@]}"}; do
+        IFS="$FS" read -r table dir list key stable <<< "$spec"
+        mkdir -p "$dir"
+
+        local -A stable_set=()
+        if [ -n "$stable" ] && [ "$OPT_NO_SKIP" -eq 0 ]; then
+            local sv stable_rows
+            stable_rows=$(db_query "$stable") \
+                || die "$EX_FAIL" "the --stable query for '$table' failed"
+            while IFS= read -r sv; do
+                [ -n "$sv" ] && [ "$sv" != NULL ] && stable_set["$sv"]=1
+            done <<< "$stable_rows"
+        fi
+
+        local rows
+        rows=$(db_query "$list") \
+            || die "$EX_FAIL" "the --list query for '$table' failed"
+
+
+        local kval name safe dest skipped=0 dumped=0
+        while IFS=$'\t' read -r kval name; do
+            [ -n "$kval" ] && [ "$kval" != NULL ] || continue
+            [ -n "${name:-}" ] || name=$kval
+
+            safe=$(sanitise_name "$name") || die "$EX_CONFIG" \
+                "partition name '$name' from table '$table' is not usable as a filename; make the --list query return a sanitised name"
+            dest="$dir/${safe}.sql"
+
+            if [ -n "${stable_set[$kval]:-}" ] && [ -f "$dest" ]; then
+                # Re-dumping would produce a byte-identical file, so git would
+                # see nothing. Skipping only saves the database the work — it
+                # is never what makes the backup correct.
+                expect "$dest"
+                skipped=$(( skipped + 1 ))
+                continue
+            fi
+
+            dump_to "$dest" "$DUMP_COMPLETE_MARKER" \
+                --no-create-info --where="${key} = $(sql_quote "$kval")" -- "$table" \
+                || die "$EX_VALIDATION" "dump of partition '$name' of table '$table' failed"
+            dumped=$(( dumped + 1 ))
+        done <<< "$rows"
+
+        log "$table: $dumped dumped, $skipped unchanged"
+        unset stable_set
+    done
+}
+
+partition_dirs() {
+    local spec table dir
+    for spec in ${CFG_PARTITIONS[@]+"${CFG_PARTITIONS[@]}"}; do
+        IFS="$FS" read -r table dir _ _ _ <<< "$spec"
+        printf '%s\n' "$dir"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+cmd_backup() {
+    git_setup
+    git_preflight
+    acquire_lock
+    db_check || die "$EX_FAIL" "cannot reach the database"
+    resolve_database
+    log "backing up '$CFG_DB' via $CFG_BACKEND into $CFG_REPO"
+
+    # Paths in the configuration are relative to the repository.
+    cd "$CFG_REPO"
+
+    produce_all_dumps
+
+    local -a dirs=("$CFG_DATA_DIR")
+    local d
+    while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done < <(partition_dirs)
+    remove_orphans "${dirs[@]}"
+
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "dry run: files written, nothing committed"
+        return "$EX_OK"
+    fi
+
+    local rc=0
+    git_commit "$CFG_SCHEMA_FILE" "${dirs[@]}" || rc=$?
+    case $rc in
+        0|10) ;;   # committed, or nothing to commit
+        *) die "$EX_FAIL" "commit failed" ;;
+    esac
+
+    # Pushed even when nothing was committed: a previous run may have committed
+    # and then failed to push, and that backlog must not sit here unnoticed.
+    git_push || die "$EX_FAIL" "push failed"
+    git_maintain
+    mark_success
+}
+
+cmd_verify() {
+    db_check || die "$EX_FAIL" "cannot reach the database"
+    resolve_database
+
+    local work a b
+    work=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf $(printf '%q' "$work")" EXIT
+    a="$work/a" b="$work/b"
+
+    OPT_NO_SKIP=1   # skipping would defeat the point of the comparison
+    local pass
+    for pass in "$a" "$b"; do
+        mkdir -p "$pass"
+        ( cd "$pass" && EXPECTED=() && produce_all_dumps ) >/dev/null
+    done
+
+    log "comparing two independent dumps of '$CFG_DB'"
+    if diff -r "$a" "$b" > "$work/diff" 2>&1; then
+        log "DETERMINISTIC: both dumps are byte-identical"
+        return "$EX_OK"
+    fi
+
+    warn "NOT DETERMINISTIC: the two dumps differ. Every backup will store a"
+    warn "full copy instead of a diff, and the repository will grow without bound."
+    head -40 "$work/diff" >&2
+    return "$EX_VALIDATION"
+}
+
+cmd_check_fresh() {
+    [ -n "$CFG_FRESH_MAX_AGE" ] || \
+        die "$EX_CONFIG" "check-fresh needs a deadline: add 'freshness <seconds>' to the config"
+    git_in_repo rev-parse --git-dir >/dev/null 2>&1 || \
+        die "$EX_CONFIG" "not a git repository: $CFG_REPO"
+
+    local f age
+    f=$(state_file)
+    if [ ! -f "$f" ]; then
+        printf 'STALE: no successful backup has ever been recorded\n'
+        notify "backup of $CFG_REPO has never succeeded"
+        exit "$EX_STALE"
+    fi
+
+    age=$(( $(date +%s) - $(cat "$f") ))
+    if [ "$age" -gt "$CFG_FRESH_MAX_AGE" ]; then
+        printf 'STALE: last successful backup %s ago, limit %s\n' \
+            "$(human_duration "$age")" "$(human_duration "$CFG_FRESH_MAX_AGE")"
+        notify "backup of $CFG_REPO is stale: $(human_duration "$age") since the last success"
+        exit "$EX_STALE"
+    fi
+
+    printf 'FRESH: last successful backup %s ago\n' "$(human_duration "$age")"
+}
+
+cmd_doctor() {
+    printf 'tool           %s\n' "$VERSION"
+    printf 'backend        %s\n' "$CFG_BACKEND"
+    printf 'credentials    %s\n' "$CFG_CREDS_MODE"
+    printf 'repository     %s\n' "$CFG_REPO"
+
+    git_setup
+    git_preflight
+    printf 'repository ok  writable, on %s\n' "$(git_current_branch)"
+
+    if db_check; then
+        resolve_database
+        printf 'database       %s (reachable)\n' "$CFG_DB"
+        printf 'tables         %s\n' "$(db_tables | grep -c .)"
+    else
+        printf 'database       UNREACHABLE\n'
+    fi
+
+    printf 'loose objects  %s (packing threshold %s)\n' "$(git_loose_count)" "$CFG_GC_LOOSE_LIMIT"
+
+    local branch remote_sha local_sha
+    branch=${CFG_BRANCH:-$(git_current_branch)}
+    local_sha=$(git_head_sha)
+    remote_sha=$(git_in_repo ls-remote "$CFG_REMOTE" "refs/heads/$branch" 2>/dev/null | cut -f1 || printf '')
+    if [ -z "$local_sha" ]; then
+        printf 'remote         no commits yet\n'
+    elif [ "$local_sha" = "$remote_sha" ]; then
+        printf 'remote         in sync\n'
+    else
+        printf 'remote         OUT OF SYNC (local %s, remote %s)\n' \
+            "${local_sha:0:8}" "${remote_sha:0:8}"
+    fi
+
+    local f
+    f=$(state_file)
+    if [ -f "$f" ]; then
+        printf 'last success   %s ago\n' "$(human_duration "$(( $(date +%s) - $(cat "$f") ))")"
+    else
+        printf 'last success   never recorded\n'
+    fi
+}
+
+cmd_gc() {
+    log "repacking $CFG_REPO ($(git_loose_count) loose objects)"
+    git_in_repo gc --prune=now
+    log "done; $(git_loose_count) loose objects remain"
+}
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+main() {
+    local command=${1:-help}
+    case $command in
+        help|-h|--help) usage; exit "$EX_OK" ;;
+        version|--version) printf 'mysql-backup %s\n' "$VERSION"; exit "$EX_OK" ;;
+    esac
+    shift
+
+    local config=${1:-}
+    [ -n "$config" ] || { usage >&2; die "$EX_CONFIG" "command '$command' needs a config file"; }
+    shift
+
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --no-skip) OPT_NO_SKIP=1; shift ;;
+            --dry-run) OPT_DRY_RUN=1; shift ;;
+            *) usage >&2; die "$EX_CONFIG" "unknown option '$1'" ;;
+        esac
+    done
+
+    load_config "$config"
+
+    case $command in
+        backup)      cmd_backup ;;
+        verify)      cmd_verify ;;
+        check-fresh) cmd_check_fresh ;;
+        doctor)      cmd_doctor ;;
+        gc)          cmd_gc ;;
+        *) usage >&2; die "$EX_CONFIG" "unknown command '$command'" ;;
+    esac
+}
+
+main "$@"
