@@ -30,46 +30,110 @@ similar for those, and this for the database.
 
 ## Install
 
+One file. Clone it, or copy `mysql-backup` onto the server and make it
+executable.
+
 ```sh
 git clone https://github.com/pohape/mysql-backup-tool.git
 ```
 
-Requirements: bash 4.3+, git, and the `mysql`/`mysqldump` client (or
-`mariadb`/`mariadb-dump`) — either on the host or inside the database container.
-No other dependencies.
+Requirements: Linux, bash 4.0+, git, and the `mysql`/`mysqldump` client (or
+`mariadb`/`mariadb-dump`) — either on the host or inside the database
+container. Nothing else.
+
+## Installing on a server
+
+Clone the tool **once per server**, not once per database. It keeps no state of
+its own: everything specific to a database lives in that database's config
+file, and everything specific to a backup lives in that backup's repository.
+Several databases on one machine share one copy of the tool.
+
+```
+~/mysql-backup-tool/          one clone, all databases
+~/backup-configs/shop.conf    one config per database
+~/backup-configs/crm.conf
+~/backups/shop/               one repository per database
+~/backups/crm/
+```
+
+```cron
+17 4 * * * ~/mysql-backup-tool/mysql-backup backup ~/backup-configs/shop.conf >> ~/logs/shop-backup.log 2>&1
+23 4 * * * ~/mysql-backup-tool/mysql-backup backup ~/backup-configs/crm.conf  >> ~/logs/crm-backup.log  2>&1
+ 0 */6 * * * ~/mysql-backup-tool/mysql-backup check-fresh ~/backup-configs/shop.conf
+```
+
+Give each database its own remote repository. Sharing one between two databases
+means two writers on one branch, and every push after the first is rejected.
 
 ## Quick start
 
-Create the repository that will hold the backups:
+Write a config — plain shell variables (see `examples/`):
 
 ```sh
-git init ~/myapp-backup
-cd ~/myapp-backup && git remote add origin git@github.com:you/myapp-backup.git
-```
+ENV_FILE="$HOME/myapp/.env"   # read the credentials from the app's own .env
+ENV_USER_KEY=DB_USERNAME
+ENV_PASSWORD_KEY=DB_PASSWORD
+ENV_DATABASE_KEY=DB_DATABASE
 
-Write a config (see `examples/`):
-
-```sh
-connect_native --host 127.0.0.1 --port 3306
-
-credentials_from_env_file "$HOME/myapp/.env" \
-    --user DB_USERNAME --password DB_PASSWORD --database DB_DATABASE
-
-repository "$HOME/myapp-backup" --branch main
+REPO="$HOME/myapp-backup"                            # where it lives here
+REMOTE_URL=git@github.com:you/myapp-backup.git       # where it is pushed
+BRANCH=main
+# SSH_KEY="$HOME/.ssh/myapp_backup_deploy"           # a dedicated deploy key
 
 table_exclude sessions        # rebuilt on login; restoring them logs everyone out
 table_schema_only audit_log   # keep the structure, drop the rows
 
-freshness 90000               # daily, plus slack — used by check-fresh
+FRESHNESS=90000               # daily, plus slack — used by check-fresh
 ```
+
+If the database runs in a container, add `DB_CONTAINER=myapp-db` and the dump
+runs inside it: the host needs no mysql client, and the database port does not
+have to be exposed to the host.
+
+Then create the backup repository and wire up its remote and deploy key:
+
+```sh
+./mysql-backup init myapp.conf
+```
+
+That is `git init`, the branch, `git remote add` and `core.sshCommand` in one
+step, and it is safe to re-run. It also tries to reach the remote, so a deploy
+key added without write access is caught now rather than at the first push.
 
 Check everything before trusting it:
 
 ```sh
-mysql-backup doctor  myapp.conf     # config, connectivity, repository health
-mysql-backup verify  myapp.conf     # proves the dump is deterministic
-mysql-backup backup  myapp.conf     # the real thing
+./mysql-backup doctor  myapp.conf   # config, connectivity, repository health
+./mysql-backup verify  myapp.conf   # proves the dump is deterministic
+./mysql-backup backup  myapp.conf   # the real thing
 ```
+
+## Choosing which tables
+
+By default every table is backed up and you name the exceptions:
+
+```sh
+table_exclude sessions        # not in the backup at all, structure included
+table_schema_only audit_log   # structure kept, rows dropped
+```
+
+When most of a database is disposable — queues, caches, mail spools — and only
+a few tables hold anything you would miss, turn it around:
+
+```sh
+TABLE_MODE=include
+table_include orders customers invoices
+```
+
+A whitelist has one weakness: a table added later is not backed up, and nobody
+finds out. So the tool prints the unlisted tables on **every** run —
+
+```
+include mode: 10 table(s) not listed, structure kept without rows: currency_rate incoming_email …
+```
+
+— and keeps their structure even though it drops their rows. Losing the rows
+may be intended; losing the table definition never is.
 
 Then from cron:
 
@@ -145,7 +209,12 @@ This is not a marginal effect. In the incident that motivated the feature,
 | `gc` | Repack now, ignoring the threshold. |
 
 Options: `--no-skip` re-dumps every partition; `--dry-run` writes the files but
-does not commit or push.
+does not commit or push; `--allow-prune` permits a large deletion of files
+whose rows are gone from the database.
+
+That last one exists because deleting is the one thing that can destroy a
+backup. If a run would remove more files than it keeps, it stops and asks
+rather than guessing that you meant it.
 
 Exit codes: `0` success (also "already running" and "nothing changed"),
 `1` failure, `2` configuration error, `3` a dump failed validation,
@@ -214,10 +283,10 @@ The password is never passed as a command-line argument — not to `mysqldump`,
 and not to `docker` either, since `docker exec -e SECRET=...` is just as visible
 in `ps`. Depending on the setup it travels one of three ways:
 
-- **native** — as an environment variable on the dump process only;
+- **local client** — as an environment variable on the dump process only;
 - **container** — over stdin, into a shell inside the container;
-- **container_env** — never at all: the dump reads it from the container's own
-  environment, and the host never holds it.
+- **`CREDS_IN_CONTAINER=1`** — never at all: the dump reads it from the
+  container's own environment, and the host never holds it.
 
 Keep config files out of version control. The shipped `.gitignore` excludes
 `*.conf` for exactly that reason.

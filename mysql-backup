@@ -1,0 +1,1195 @@
+#!/usr/bin/env bash
+#
+# mysql-backup — back up a MySQL or MariaDB database into a git repository,
+# storing each run as a diff rather than another full copy.
+#
+# One file, no dependencies beyond git and a mysql client. See README.md.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
+    echo "mysql-backup needs bash 4.3 or newer (found ${BASH_VERSION}); it also needs flock and timeout, so Linux." >&2
+    exit 2
+fi
+
+# ===========================================================================
+# Settings. A config file is a shell script that overrides these.
+# ===========================================================================
+
+# --- how to reach the database ---------------------------------------------
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_NAME=                # left empty, it is read from the connection
+DB_USER=
+DB_PASSWORD=            # prefer ENV_FILE or CREDS_IN_CONTAINER over setting this
+
+DB_CONTAINER=           # set => run the client inside this docker container
+ROOTLESS_DOCKER=0       # 1 => point DOCKER_HOST at the user's own daemon
+
+# Where the credentials come from. Setting CREDS_IN_CONTAINER is the safest
+# option: the password is read inside the container and never reaches the host.
+ENV_FILE=               # a .env to read the credentials from
+ENV_USER_KEY=DB_USER
+ENV_PASSWORD_KEY=DB_PASSWORD
+ENV_DATABASE_KEY=DB_NAME
+ENV_HOSTPORT_KEY=       # optional, for "host:port" in a single variable
+CREDS_IN_CONTAINER=0
+CONTAINER_USER_VAR=MYSQL_USER
+CONTAINER_PASSWORD_VAR=MYSQL_PASSWORD
+CONTAINER_DATABASE_VAR=MYSQL_DATABASE
+
+# MariaDB 11 renamed these and deprecated the old names.
+DUMP_BIN=mysqldump
+CLIENT_BIN=mysql
+
+# --- the repository --------------------------------------------------------
+REPO=                   # where the backup lives on this machine
+REMOTE_URL=             # where it is pushed; `init` wires this up
+REMOTE=origin
+BRANCH=
+SSH_KEY=                # a dedicated deploy key, configured in the repository
+PUSH_RETRIES=3
+
+# --- layout ----------------------------------------------------------------
+SCHEMA_FILE=schema.sql
+DATA_DIR=data
+
+# --- policy ----------------------------------------------------------------
+FRESHNESS=              # seconds; required by check-fresh
+DUMP_TIMEOUT=3600
+GC_LOOSE_LIMIT=500      # pack once this many loose objects accumulate
+ORPHAN_LIMIT=20         # refuse to delete more than this without --allow-prune
+DUMP_EVENTS=1           # scheduled events are part of the schema
+NOTIFY_COMMAND=
+
+# --- collected by the functions below --------------------------------------
+TABLE_MODE=exclude      # exclude: back up everything but the listed tables
+                        # include: back up only the listed tables
+declare -a TABLES_INCLUDE=() TABLES_EXCLUDE=() TABLES_SCHEMA_ONLY=() DUMP_EXTRA=()
+declare -a PART_TABLE=() PART_DIR=() PART_LIST=() PART_KEY=() PART_STABLE=()
+
+# ===========================================================================
+# Config file vocabulary
+# ===========================================================================
+
+# Choosing which tables get their rows backed up. Two modes, set with
+# TABLE_MODE, because the right answer depends on what the database is.
+#
+#   TABLE_MODE=exclude (default)
+#       Everything is backed up except what you list. Safe by default: a table
+#       added next year is protected from its first day.
+#
+#   TABLE_MODE=include
+#       Only what you list gets its rows. Use it when most of the database is
+#       disposable — queues, caches, mail spools — and only a few tables carry
+#       anything you would miss. The cost is that a new table is not backed up
+#       until someone adds it to the list, so the tool prints which tables are
+#       not listed on every run: the omission stays visible instead of silent.
+#
+# In both modes:
+#   table_schema_only  keeps the structure and drops the rows.
+#   table_exclude      leaves the table out of the backup entirely, structure
+#                      included — so a restore will not have it at all.
+#
+# In include mode, a table that is neither listed nor excluded keeps its
+# structure without its rows. Losing the rows may be intended; losing the table
+# definition never is.
+table_include()     { TABLES_INCLUDE+=("$@"); }
+table_exclude()     { TABLES_EXCLUDE+=("$@"); }
+table_schema_only() { TABLES_SCHEMA_ONLY+=("$@"); }
+
+# dump_option <arg...> — extra mysqldump flags, for anything not portable
+#                        (--set-gtid-purged=OFF is MySQL-only, for instance).
+dump_option() { DUMP_EXTRA+=("$@"); }
+
+# partition <table> --dir DIR --list SQL --key COLUMN [--stable SQL]
+#
+# Split a table along a column whose values have a one-way lifecycle — a job
+# that finishes, an account that closes, a day that ends. Each value gets its
+# own file, which becomes byte-identical forever once its subject stops
+# changing. Git then stores that file once, and every later backup adds nothing
+# for it. This is what lets a large table be backed up hourly for years.
+#
+#   --list    two columns: the value to match, and the filename stem
+#   --key     the column in <table> holding that value
+#   --stable  values that can no longer change; their files are not re-dumped.
+#             A load optimisation only — a fresh dump would be identical anyway
+#             — so nothing depends on it being right. `verify` ignores it.
+partition() {
+    local table=${1:?partition needs a table name}; shift
+    local dir="" list="" key="" stable=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --dir)    dir=$2;    shift 2 ;;
+            --list)   list=$2;   shift 2 ;;
+            --key)    key=$2;    shift 2 ;;
+            --stable) stable=$2; shift 2 ;;
+            *) die "$EX_CONFIG" "partition $table: unknown option '$1'" ;;
+        esac
+    done
+    [ -n "$dir" ]  || die "$EX_CONFIG" "partition $table: --dir is required"
+    [ -n "$list" ] || die "$EX_CONFIG" "partition $table: --list is required"
+    [ -n "$key" ]  || die "$EX_CONFIG" "partition $table: --key is required"
+
+    PART_TABLE+=("$table"); PART_DIR+=("$dir"); PART_LIST+=("$list")
+    PART_KEY+=("$key");     PART_STABLE+=("$stable")
+}
+
+# ===========================================================================
+# Logging
+# ===========================================================================
+#
+# Every line is timestamped. A backup log without timestamps cannot answer
+# "when did this stop working", which is the only question that ever matters.
+
+EX_OK=0          # success
+EX_FAIL=1        # generic failure
+EX_CONFIG=2      # wrong configuration; retrying will not help
+EX_VALIDATION=3  # a dump was produced but failed its checks
+EX_STALE=4       # freshness deadline missed (check-fresh only)
+
+_ts()  { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+log()  { printf '%s %s\n'      "$(_ts)" "$*"; }
+warn() { printf '%s WARN %s\n' "$(_ts)" "$*" >&2; }
+
+notify() {
+    [ -n "$NOTIFY_COMMAND" ] || return 0
+    "$NOTIFY_COMMAND" "$1" || warn "NOTIFY_COMMAND failed (exit $?)"
+}
+
+die() {
+    local code=$1; shift
+    printf '%s FATAL %s\n' "$(_ts)" "$*" >&2
+    notify "FAILED: $*"
+    exit "$code"
+}
+
+# ===========================================================================
+# Paths
+# ===========================================================================
+
+# norm_path <path> — one spelling per file, so lookups match.
+#
+# Without this, DATA_DIR="data/" produces the key "data//x.sql" while `find`
+# reports "data/x.sql". The file then looks like an orphan and gets deleted —
+# a whole backup lost to a trailing slash.
+norm_path() {
+    local p=$1
+    while [ "$p" != "${p//\/\//\/}" ]; do p=${p//\/\//\/}; done
+    p=${p#./}
+    [ "$p" = "/" ] || p=${p%/}
+    printf '%s' "$p"
+}
+
+# require_inside_repo <path> <what> — reject anything that could escape.
+#
+# remove_orphans deletes files under these directories. A path from the config
+# that is absolute or climbs out with .. would point that deletion at somebody
+# else's tree.
+require_inside_repo() {
+    local p=$1 what=$2
+    case $p in
+        /*)      die "$EX_CONFIG" "$what must be relative to the repository, got '$p'" ;;
+        ..|../*|*/../*|*/..) die "$EX_CONFIG" "$what must not contain '..', got '$p'" ;;
+        '')      die "$EX_CONFIG" "$what must not be empty" ;;
+    esac
+}
+
+abs_path() {
+    case $1 in
+        /*) printf '%s' "$1" ;;
+        *)  printf '%s/%s' "$PWD" "$1" ;;
+    esac
+}
+
+# ===========================================================================
+# Reading a .env
+# ===========================================================================
+
+# env_value <file> <key>
+#
+# Only the named keys are read; the file is never sourced. A .env commonly
+# holds unrelated definitions with shell metacharacters in them, and sourcing
+# it would execute those. Tolerates `export ` prefixes, comments, CRLF line
+# endings and quoted values.
+env_value() {
+    local file=$1 key=$2 v
+    [ -f "$file" ] || die "$EX_CONFIG" "env file not found: $file"
+    v=$(awk -v key="$key" '
+        { sub(/\r$/, "") }
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+            eq = index(line, "=")
+            if (eq == 0) next
+            k = substr(line, 1, eq - 1)
+            gsub(/[[:space:]]/, "", k)
+            if (k != key) next
+            v = substr(line, eq + 1)
+            sub(/^[[:space:]]+/, "", v)
+            if (v ~ /^".*"$/ || v ~ /^'"'"'.*'"'"'$/) v = substr(v, 2, length(v) - 2)
+            print v; found = 1; exit
+        }
+        END { if (!found) exit 3 }
+    ' "$file") || die "$EX_CONFIG" "key '$key' not found in $file"
+    printf '%s' "$v"
+}
+
+# ===========================================================================
+# Loading and validating the configuration
+# ===========================================================================
+
+BACKEND=native
+CREDS=direct
+
+load_config() {
+    local path=$1
+    [ -f "$path" ] || die "$EX_CONFIG" "config not found: $path"
+    # shellcheck disable=SC1090
+    . "$path"
+
+    [ -z "$DB_CONTAINER" ] || BACKEND=container
+
+    if [ "$CREDS_IN_CONTAINER" = 1 ]; then
+        CREDS=container
+    elif [ -n "$ENV_FILE" ]; then
+        CREDS=env_file
+    fi
+
+    # Resolved before anything changes directory, so a relative path in the
+    # config keeps meaning what the person who wrote it meant.
+    [ -n "$REPO" ]         && REPO=$(abs_path "$REPO")
+    [ -n "$ENV_FILE" ] && ENV_FILE=$(abs_path "$ENV_FILE")
+    [ -n "$SSH_KEY" ]  && SSH_KEY=$(abs_path "$SSH_KEY")
+
+    if [ "$ROOTLESS_DOCKER" = 1 ]; then
+        # cron does not read ~/.bashrc, so a rootless setup that works by hand
+        # fails from cron with "cannot connect to the Docker daemon".
+        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+        export DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/docker.sock"
+    fi
+
+    if [ "$CREDS" = env_file ]; then
+        [ -n "$ENV_USER_KEY" ]     && DB_USER=$(env_value "$ENV_FILE" "$ENV_USER_KEY")
+        [ -n "$ENV_PASSWORD_KEY" ] && DB_PASSWORD=$(env_value "$ENV_FILE" "$ENV_PASSWORD_KEY")
+        [ -n "$ENV_DATABASE_KEY" ] && DB_NAME=$(env_value "$ENV_FILE" "$ENV_DATABASE_KEY")
+        if [ -n "$ENV_HOSTPORT_KEY" ]; then
+            local hp; hp=$(env_value "$ENV_FILE" "$ENV_HOSTPORT_KEY")
+            DB_HOST=${hp%%:*}
+            [ "$hp" = "$DB_HOST" ] || DB_PORT=${hp##*:}
+        fi
+    fi
+
+    validate_config
+}
+
+validate_config() {
+    [ -n "$REPO" ] || die "$EX_CONFIG" "REPO is not set"
+
+    if [ "$CREDS" = container ] && [ "$BACKEND" = native ]; then
+        die "$EX_CONFIG" "CREDS_IN_CONTAINER needs DB_CONTAINER"
+    fi
+    if [ "$CREDS" != container ] && [ -z "$DB_USER" ]; then
+        # An empty user would collapse `-u""` into a bare `-u`, and the client
+        # would silently take the next argument as the username.
+        die "$EX_CONFIG" "no database user: set DB_USER, or ENV_USER_KEY with ENV_FILE"
+    fi
+    if [ "$CREDS" != container ] && [ -z "$DB_NAME" ]; then
+        die "$EX_CONFIG" "no database name: set DB_NAME, or ENV_DATABASE_KEY with ENV_FILE"
+    fi
+
+    require_inside_repo "$SCHEMA_FILE" "SCHEMA_FILE"
+    require_inside_repo "$DATA_DIR" "DATA_DIR"
+    DATA_DIR=$(norm_path "$DATA_DIR")
+    SCHEMA_FILE=$(norm_path "$SCHEMA_FILE")
+
+    local i
+    for i in "${!PART_DIR[@]}"; do
+        require_inside_repo "${PART_DIR[$i]}" "partition ${PART_TABLE[$i]}: --dir"
+        PART_DIR[$i]=$(norm_path "${PART_DIR[$i]}")
+    done
+
+    local n
+    for n in FRESHNESS DUMP_TIMEOUT GC_LOOSE_LIMIT ORPHAN_LIMIT PUSH_RETRIES; do
+        case ${!n} in ''|*[!0-9]*) [ -z "${!n}" ] || die "$EX_CONFIG" "$n must be a whole number, got '${!n}'" ;; esac
+    done
+}
+
+# ===========================================================================
+# Talking to the database
+# ===========================================================================
+#
+# One rule: the password is never a command-line argument. Anything in argv is
+# readable by every user on the host through `ps` — and that includes the
+# arguments of `docker exec`, not only those of mysqldump.
+#
+#   native                       an environment variable of the dump process
+#   container                    handed over stdin to a shell in the container
+#   container, CREDS_IN_CONTAINER  never leaves the container at all
+
+# Flags every dump gets. The first three are about consistency and memory; the
+# rest are what make two dumps of unchanged data byte-identical, which is the
+# whole premise of keeping backups in git.
+DUMP_DEFAULTS=(
+    --single-transaction --quick --no-tablespaces
+    --skip-extended-insert --order-by-primary --skip-dump-date
+    --default-character-set=utf8mb4
+)
+
+_shq() { local s=${1//\'/\'\\\'\'}; printf "'%s'" "$s"; }
+
+_container_exec() { docker exec -i "$DB_CONTAINER" "$@"; }
+
+# _run_client <binary> <args...> — @DB@ is replaced by the database name.
+_run_client() {
+    local bin=$1; shift
+    local x
+
+    if [ "$BACKEND" = native ]; then
+        local -a args=()
+        for x in "$@"; do
+            if [ "$x" = "@DB@" ]; then args+=("$DB_NAME"); else args+=("$x"); fi
+        done
+        MYSQL_PWD="$DB_PASSWORD" timeout "$DUMP_TIMEOUT" "$bin" \
+            -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER" "${args[@]}"
+        return
+    fi
+
+    local dbexpr uexpr auth via_stdin
+    if [ "$CREDS" = container ]; then
+        dbexpr="\"\$${CONTAINER_DATABASE_VAR}\""
+        uexpr="\"\$${CONTAINER_USER_VAR}\""
+        auth="export MYSQL_PWD=\"\$${CONTAINER_PASSWORD_VAR}\"; "
+        via_stdin=0
+    else
+        dbexpr=$(_shq "$DB_NAME")
+        uexpr=$(_shq "$DB_USER")
+        auth='IFS= read -r MYSQL_PWD; export MYSQL_PWD; '
+        via_stdin=1
+    fi
+
+    # The timeout has to live inside the container. A `timeout` around
+    # `docker exec` only kills the client on the host: the dump keeps running,
+    # holding its transaction open, and every retry adds another one.
+    local cmd="if command -v timeout >/dev/null 2>&1; then set -- timeout ${DUMP_TIMEOUT}; else set --; fi; "
+    cmd+="${auth}exec \"\$@\" $(_shq "$bin") -u${uexpr}"
+    for x in "$@"; do
+        if [ "$x" = "@DB@" ]; then cmd+=" $dbexpr"; else cmd+=" $(_shq "$x")"; fi
+    done
+
+    if [ "$via_stdin" -eq 1 ]; then
+        printf '%s\n' "$DB_PASSWORD" | _container_exec sh -c "$cmd"
+    else
+        # stdin is closed explicitly: `docker exec -i` inherits it, and a run
+        # started from a script would otherwise have the rest of that script
+        # eaten by the container.
+        _container_exec sh -c "$cmd" < /dev/null
+    fi
+}
+
+db_query() { _run_client "$CLIENT_BIN" -N -B -e "$1" @DB@; }
+
+db_dump() {
+    local -a opts=() tables=()
+    local sep=0 a
+    for a in "$@"; do
+        if [ "$a" = "--" ] && [ $sep -eq 0 ]; then sep=1; continue; fi
+        if [ $sep -eq 1 ]; then tables+=("$a"); else opts+=("$a"); fi
+    done
+    _run_client "$DUMP_BIN" "${DUMP_DEFAULTS[@]}" ${DUMP_EXTRA[@]+"${DUMP_EXTRA[@]}"} \
+        ${opts[@]+"${opts[@]}"} @DB@ ${tables[@]+"${tables[@]}"}
+}
+
+# Views are left out: mysqldump emits them with the schema, and dumping their
+# rows would duplicate data that already lives in the underlying tables.
+db_tables() {
+    db_query "SELECT table_name FROM information_schema.tables
+              WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
+              ORDER BY table_name"
+}
+
+# ===========================================================================
+# Producing files git can store cheaply
+# ===========================================================================
+
+declare -A EXPECTED=()   # every path this run is allowed to leave behind
+WORK_TMP=""              # scratch directory, outside the working tree
+
+# The literal last line mysqldump writes. Its presence proves the dump ran to
+# completion — a far better truncation test than any size heuristic, and it
+# holds even for a dump that legitimately contains no rows.
+#
+# It is checked before canonicalisation, which strips this line, and it is the
+# one trailer both vendors agree on: MySQL ends with SET SQL_NOTES, MariaDB
+# with SET NOTE_VERBOSITY, so anything further down is vendor-specific.
+DUMP_END_MARKER='-- Dump completed'
+
+# sanitise_name <string>
+#
+# Partition names become filenames. A name with a slash or `..` would write
+# outside the repository, so anything outside a conservative set is rejected
+# rather than mangled: a quietly renamed file no longer matches its data.
+sanitise_name() {
+    case $1 in
+        ''|.|..|-*)        return 1 ;;
+        *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    printf '%s' "$1"
+}
+
+# sql_quote <string> — a SQL literal.
+#
+# The quote is doubled rather than backslash-escaped: backslash escaping is
+# disabled under sql_mode=NO_BACKSLASH_ESCAPES, where \' would end the literal
+# instead of escaping it.
+sql_quote() { local s=${1//\'/\'\'}; printf "'%s'" "$s"; }
+
+# canonicalise <file>
+#
+# Removes exactly two kinds of run-to-run noise, and nothing else:
+#
+#   1. Version banners, which change when the client or the server is upgraded
+#      and would otherwise rewrite every file at once. (The dump date is
+#      already gone — the dump runs with --skip-dump-date.)
+#   2. AUTO_INCREMENT in a table's closing line. That counter advances on every
+#      insert, and on rollbacks and restarts too, even when no row changed.
+#      Dropping it is safe: on restore the counter is set to MAX(id)+1.
+#
+# The patterns are anchored tightly on purpose. Deleting every line that starts
+# with "--" is shorter, but a text column containing a newline followed by
+# "-- " would then lose that line: silent corruption inside a backup.
+canonicalise() {
+    local file=$1 tmp="$1.canon"
+    awk '
+        /^-- (MySQL|MariaDB) dump / { next }
+        /^-- Server version/        { next }
+        /^-- Dump completed/        { next }
+        /^\) ENGINE=/               { gsub(/ AUTO_INCREMENT=[0-9]+/, "") }
+        { print }
+    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file"
+}
+
+# validate_dump <file> <rows: any|required>
+validate_dump() {
+    local file=$1 rows=$2
+
+    [ -s "$file" ] || { warn "dump is empty: $file"; return 1; }
+
+    # Only the tail is examined, so a table storing SQL text cannot make a
+    # truncated dump look complete by containing the marker in its data.
+    # -e is load-bearing: the marker starts with "--" and grep would otherwise
+    # read it as its own options and match everything.
+    if ! tail -c 2048 "$file" | grep -qF -e "$DUMP_END_MARKER"; then
+        warn "dump is truncated (no end marker): $file"
+        return 1
+    fi
+
+    # A partition key came from the database, so rows for it exist. A dump with
+    # none means the WHERE clause stopped matching — a broken backup that would
+    # otherwise validate perfectly.
+    if [ "$rows" = required ] && ! grep -qF 'INSERT INTO' "$file"; then
+        warn "partition dump contains no rows, but its key came from the database: $file"
+        return 1
+    fi
+    return 0
+}
+
+# dump_to <destination> <rows: any|required> <dump-args...>
+#
+# Writes to scratch space outside the working tree, canonicalises, validates,
+# and only then moves the file into place. Nothing that fails can replace a
+# good backup, and nothing half-written is ever visible to git.
+dump_to() {
+    local dest rows tmp
+    dest=$(norm_path "$1"); rows=$2; shift 2
+
+    if [ -n "${EXPECTED[$dest]:-}" ]; then
+        die "$EX_CONFIG" "two sources both write '$dest'; make the --list query return unique names"
+    fi
+
+    tmp=$(mktemp "$WORK_TMP/dump.XXXXXXXX")
+
+    if ! db_dump "$@" > "$tmp"; then
+        rm -f "$tmp"; warn "dump failed for $dest (previous version kept)"; return 1
+    fi
+    # Validated first, while the completion marker is still there.
+    if ! validate_dump "$tmp" "$rows"; then
+        rm -f "$tmp"; return 1
+    fi
+    if ! canonicalise "$tmp"; then
+        rm -f "$tmp"; warn "could not canonicalise $dest (previous version kept)"; return 1
+    fi
+
+    mkdir -p "$(dirname "$dest")"
+    mv -f "$tmp" "$dest"
+    chmod 0644 "$dest"
+    EXPECTED[$dest]=1
+}
+
+# expect <path> — keep a file this run deliberately did not re-dump.
+expect() {
+    local p; p=$(norm_path "$1")
+    [ -z "${EXPECTED[$p]:-}" ] || \
+        die "$EX_CONFIG" "two sources both claim '$p'; make the --list query return unique names"
+    EXPECTED[$p]=1
+}
+
+# remove_orphans <dir...>
+#
+# A partition renamed or deleted in the database must not leave its file
+# behind, or the backup slowly becomes an archive of everything the database
+# ever contained. But this is the one operation that can destroy a backup, so
+# it refuses to run away with itself: a mass deletion needs --allow-prune.
+remove_orphans() {
+    local dir f
+    local -a doomed=()
+
+    for dir in "$@"; do
+        [ -d "$dir" ] || continue
+        while IFS= read -r -d '' f; do
+            f=$(norm_path "$f")
+            [ -n "${EXPECTED[$f]:-}" ] || doomed+=("$f")
+        done < <(find "$dir" -type f \( -name '*.sql' -o -name '*.sql.tmp' -o -name '*.sql.canon' \) -print0)
+    done
+
+    local n=${#doomed[@]}
+    [ "$n" -gt 0 ] || return 0
+
+    local kept=${#EXPECTED[@]}
+    if [ "$ALLOW_PRUNE" -eq 0 ] && { [ "$n" -gt "$ORPHAN_LIMIT" ] || [ "$n" -gt "$kept" ]; }; then
+        die "$EX_FAIL" \
+            "refusing to delete $n file(s) while keeping $kept: this looks like a failure, not a cleanup. Re-run with --allow-prune if it really is intended."
+    fi
+
+    rm -f -- "${doomed[@]}"
+    log "removed $n orphaned file(s)"
+}
+
+# ===========================================================================
+# The git side
+# ===========================================================================
+#
+# Everything here exists because of a failure that actually happened.
+
+git_in_repo() { git -C "$REPO" "$@"; }
+git_dir()     { git_in_repo rev-parse --absolute-git-dir; }
+
+# Works before the first commit, where `rev-parse --abbrev-ref HEAD` fails and
+# helpfully returns the literal string "HEAD" for use as a branch name.
+git_current_branch() { git_in_repo symbolic-ref --short -q HEAD; }
+git_head_sha()       { git_in_repo rev-parse --verify --quiet HEAD || true; }
+
+git_setup() {
+    git_in_repo config user.name  >/dev/null 2>&1 || git_in_repo config user.name  "mysql-backup"
+    git_in_repo config user.email >/dev/null 2>&1 || git_in_repo config user.email "mysql-backup@localhost"
+    # A key named in the repository, rather than a host alias in ~/.ssh/config,
+    # keeps the deployment self-contained: nothing outside this directory has
+    # to be edited for the push to work.
+    [ -z "$SSH_KEY" ] || git_in_repo config core.sshCommand "ssh -i '$SSH_KEY' -o IdentitiesOnly=yes"
+}
+
+# git_preflight — refuse to start unless the repository can actually be written.
+#
+# A backup script once ran hourly for two and a half months without producing a
+# single backup: one earlier run as root had left the reflog root-owned, so
+# every `git commit` failed while the dump file kept being rewritten with fresh
+# data. Everything anyone was watching looked healthy. These checks turn that
+# into one loud error on the first run.
+git_preflight() {
+    [ -d "$REPO" ] || die "$EX_CONFIG" "repository directory does not exist: $REPO"
+    git_in_repo rev-parse --git-dir >/dev/null 2>&1 || die "$EX_CONFIG" "not a git repository: $REPO"
+    git_in_repo symbolic-ref -q HEAD >/dev/null 2>&1 || \
+        die "$EX_CONFIG" "HEAD is detached in $REPO; commits would go nowhere"
+
+    local gd; gd=$(git_dir)
+
+    # An unfinished merge would let `git add -A` mark conflicted files resolved
+    # and commit the conflict markers as if they were data.
+    local s
+    for s in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+        [ ! -e "$gd/$s" ] || die "$EX_CONFIG" "$REPO is in the middle of an operation ($s); finish or abort it first"
+    done
+    for s in rebase-merge rebase-apply; do
+        [ ! -d "$gd/$s" ] || die "$EX_CONFIG" "$REPO has a rebase in progress; finish or abort it first"
+    done
+
+    # The write probe that would have caught those two and a half months.
+    # `git add` succeeds on a repository whose reflog cannot be written; only
+    # `git commit` fails, and by then the run looks like it worked.
+    mkdir -p "$gd/logs" 2>/dev/null || die "$EX_CONFIG" "cannot create $gd/logs"
+    local probe="$gd/logs/.write-probe.$$"
+    : > "$probe" 2>/dev/null || die "$EX_CONFIG" \
+        "cannot write to $gd/logs — commits will fail. Check ownership: a single run as root leaves root-owned reflogs behind."
+    rm -f "$probe"
+    [ -w "$gd" ] || die "$EX_CONFIG" "git directory is not writable: $gd"
+
+    [ -z "$REMOTE" ] || git_in_repo remote get-url "$REMOTE" >/dev/null 2>&1 || \
+        die "$EX_CONFIG" "remote '$REMOTE' is not configured in $REPO"
+}
+
+# A cron job that outruns its own interval must not run twice at once. Exiting
+# quietly with success is right: the next tick does the work.
+acquire_lock() {
+    exec 9>"$(git_dir)/mysql-backup.lock"
+    flock -n 9 || { log "another run holds the lock; exiting"; exit "$EX_OK"; }
+}
+
+git_commit() {
+    # Checked explicitly: if `add` fails and we fall through, the index looks
+    # unchanged and the run reports "nothing to back up" — the most dangerous
+    # way for a backup to fail.
+    git_in_repo add -A -- "$@" || { warn "git add failed"; return 1; }
+
+    if git_in_repo diff --cached --quiet; then
+        log "no changes"
+        return 10
+    fi
+
+    local stat; stat=$(git_in_repo diff --cached --shortstat | sed 's/^ *//')
+    # The date is already in the commit metadata; repeating it in the subject
+    # wastes the one line that could say what actually changed.
+    git_in_repo commit -q -m "backup: $stat" || return 1
+    log "committed: $stat"
+}
+
+# git_push — retry, and confirm the remote actually moved.
+#
+# This tool never force-pushes. A rejected push means the histories diverged,
+# which forcing does not solve; and on an append-only receiver a force push is
+# exactly the operation an attacker needs.
+git_push() {
+    local branch=${BRANCH:-$(git_current_branch)}
+    local attempt=1 delay=5 out rc
+
+    while [ "$attempt" -le "$PUSH_RETRIES" ]; do
+        out=$(git_in_repo push "$REMOTE" "HEAD:refs/heads/$branch" 2>&1) && rc=0 || rc=$?
+
+        if [ $rc -eq 0 ]; then
+            local here there
+            here=$(git_head_sha)
+            there=$(git_in_repo ls-remote "$REMOTE" "refs/heads/$branch" | cut -f1)
+            [ "$here" = "$there" ] && { log "pushed to $REMOTE/$branch"; return 0; }
+            warn "push reported success but $REMOTE/$branch is at ${there:-<missing>}, expected $here"
+            return 1
+        fi
+
+        if printf '%s' "$out" | grep -qiE 'non-fast-forward|fetch first|rejected'; then
+            warn "push rejected: the remote has commits this repository does not have."
+            warn "Resolve it by hand — this tool never force-pushes, because that is how backups get destroyed."
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+
+        warn "push attempt $attempt/$PUSH_RETRIES failed, retrying in ${delay}s"
+        sleep "$delay"; attempt=$(( attempt + 1 )); delay=$(( delay * 2 ))
+    done
+
+    warn "push failed after $PUSH_RETRIES attempts"
+    printf '%s\n' "${out:-}" >&2
+    return 1
+}
+
+git_loose_count() { git_in_repo count-objects -v | awk '/^count:/ { print $2 }'; }
+
+# git_maintain [force] — pack loose objects.
+#
+# Git writes each new object as its own file and only delta-compresses when
+# packing, so hourly backups need this. It is not a marginal effect: in the
+# incident that prompted it, 2897 loose objects held 5.64 GB where the same
+# content packed to 12.85 MB.
+git_maintain() {
+    local loose; loose=$(git_loose_count)
+    if [ "${1:-}" != force ] && [ "${loose:-0}" -lt "$GC_LOOSE_LIMIT" ]; then return 0; fi
+    log "packing ${loose} loose objects"
+    git_in_repo gc --quiet --prune=now || { warn "git gc failed"; return 0; }
+    log "packed; $(git_loose_count) loose objects remain"
+}
+
+git_commit_age() {
+    local ts; ts=$(git_in_repo log -1 --format=%ct 2>/dev/null) || return 1
+    [ -n "$ts" ] || return 1
+    printf '%s' "$(( $(date +%s) - ts ))"
+}
+
+# ===========================================================================
+# Orchestration
+# ===========================================================================
+
+declare -A INCLUDED=() EXCLUDED=() SCHEMA_ONLY=() PARTITIONED=()
+
+classify_tables() {
+    local x i
+    for x in ${TABLES_INCLUDE[@]+"${TABLES_INCLUDE[@]}"};         do INCLUDED[$x]=1; done
+    for x in ${TABLES_EXCLUDE[@]+"${TABLES_EXCLUDE[@]}"};         do EXCLUDED[$x]=1; done
+    for x in ${TABLES_SCHEMA_ONLY[@]+"${TABLES_SCHEMA_ONLY[@]}"}; do SCHEMA_ONLY[$x]=1; done
+    for i in "${!PART_TABLE[@]}"; do PARTITIONED[${PART_TABLE[$i]}]=1; done
+
+    case $TABLE_MODE in
+        exclude)
+            [ "${#INCLUDED[@]}" -eq 0 ] || die "$EX_CONFIG" \
+                "table_include only means something with TABLE_MODE=include; in exclude mode every table is included already"
+            ;;
+        include)
+            # A partitioned table is by definition one you are backing up.
+            for x in "${!PARTITIONED[@]}"; do INCLUDED[$x]=1; done
+            [ "${#INCLUDED[@]}" -gt 0 ] || die "$EX_CONFIG" \
+                "TABLE_MODE=include with nothing listed would back up no rows at all"
+            ;;
+        *) die "$EX_CONFIG" "TABLE_MODE must be 'exclude' or 'include', got '$TABLE_MODE'" ;;
+    esac
+
+    for x in "${!INCLUDED[@]}"; do
+        [ -z "${EXCLUDED[$x]:-}" ] || die "$EX_CONFIG" \
+            "table '$x' is both included and excluded"
+        [ -z "${SCHEMA_ONLY[$x]:-}" ] || die "$EX_CONFIG" \
+            "table '$x' is both included and schema-only: those ask for opposite things"
+    done
+
+    # Contradictory classification would produce a backup whose schema omits a
+    # table while its data files are there — restorable only by hand.
+    for x in "${!PARTITIONED[@]}"; do
+        [ -z "${EXCLUDED[$x]:-}" ] || die "$EX_CONFIG" \
+            "table '$x' is both excluded and partitioned: its rows would be dumped without its schema"
+        [ -z "${SCHEMA_ONLY[$x]:-}" ] || die "$EX_CONFIG" \
+            "table '$x' is both schema-only and partitioned: those ask for opposite things"
+    done
+}
+
+# The schema is one file for the whole database, not one per table: routines,
+# triggers, views and events are database-wide, and mysqldump only emits them
+# when given a database rather than a list of tables.
+dump_schema() {
+    local -a args=(--no-data --routines --triggers)
+    [ "$DUMP_EVENTS" = 1 ] && args+=(--events)
+    local t
+    for t in "${!EXCLUDED[@]}"; do args+=("--ignore-table=${DB_NAME}.${t}"); done
+
+    dump_to "$SCHEMA_FILE" any "${args[@]}" || die "$EX_VALIDATION" \
+        "schema dump failed${DUMP_EVENTS:+ (if the user lacks the EVENT privilege, set DUMP_EVENTS=0)}"
+}
+
+dump_flat_tables() {
+    local t safe tables
+
+    # Captured before the loop, not read from a process substitution: a failure
+    # inside `while read` is invisible, and the loop would simply see no
+    # tables. Together with orphan removal that turns a transient error into a
+    # committed deletion of the whole backup.
+    tables=$(db_tables) || die "$EX_FAIL" "could not list tables"
+    [ -n "$tables" ] || die "$EX_FAIL" \
+        "the database reports no tables. That is either the wrong database or a user whose grants hide them; either way it is not a backup."
+
+    local -a unlisted=()
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        [ -z "${EXCLUDED[$t]:-}" ] || continue
+        [ -z "${SCHEMA_ONLY[$t]:-}" ] || continue
+        [ -z "${PARTITIONED[$t]:-}" ] || continue
+        if [ "$TABLE_MODE" = include ] && [ -z "${INCLUDED[$t]:-}" ]; then
+            unlisted+=("$t"); continue
+        fi
+
+        safe=$(sanitise_name "$t") || die "$EX_CONFIG" \
+            "table name '$t' cannot be used as a filename; exclude it explicitly"
+        dump_to "$DATA_DIR/${safe}.sql" any --no-create-info -- "$t" \
+            || die "$EX_VALIDATION" "dump of table '$t' failed"
+    done <<< "$tables"
+
+    # Printed every run on purpose. The weakness of a whitelist is that a new
+    # table is missed in silence; saying so out loud is what makes the mode
+    # safe to use.
+    [ "${#unlisted[@]}" -eq 0 ] || \
+        log "include mode: ${#unlisted[@]} table(s) not listed, structure kept without rows: ${unlisted[*]}"
+}
+
+dump_partitions() {
+    local i table dir list key stable rows stable_rows sv kval name safe dest
+    for i in "${!PART_TABLE[@]}"; do
+        table=${PART_TABLE[$i]}; dir=${PART_DIR[$i]}; list=${PART_LIST[$i]}
+        key=${PART_KEY[$i]};     stable=${PART_STABLE[$i]}
+        mkdir -p "$dir"
+
+        local -A stable_set=()
+        if [ -n "$stable" ] && [ "$NO_SKIP" -eq 0 ]; then
+            stable_rows=$(db_query "$stable") || die "$EX_FAIL" "the --stable query for '$table' failed"
+            while IFS= read -r sv; do
+                [ -n "$sv" ] && [ "$sv" != NULL ] && stable_set["$sv"]=1
+            done <<< "$stable_rows"
+        fi
+
+        rows=$(db_query "$list") || die "$EX_FAIL" "the --list query for '$table' failed"
+
+        local dumped=0 skipped=0
+        while IFS=$'\t' read -r kval name; do
+            [ -n "$kval" ] && [ "$kval" != NULL ] || continue
+            [ -n "${name:-}" ] || name=$kval
+
+            safe=$(sanitise_name "$name") || die "$EX_CONFIG" \
+                "partition name '$name' of table '$table' cannot be a filename; sanitise it in the --list query"
+            dest="$dir/${safe}.sql"
+
+            if [ -n "${stable_set[$kval]:-}" ] && [ -f "$dest" ]; then
+                # Re-dumping would produce a byte-identical file, so git would
+                # see nothing. The skip saves the database work; it is never
+                # what makes the backup correct.
+                expect "$dest"; skipped=$(( skipped + 1 )); continue
+            fi
+
+            dump_to "$dest" required --no-create-info --where="${key} = $(sql_quote "$kval")" -- "$table" \
+                || die "$EX_VALIDATION" "dump of partition '$name' of table '$table' failed"
+            dumped=$(( dumped + 1 ))
+        done <<< "$rows"
+
+        log "$table: $dumped dumped, $skipped unchanged"
+    done
+}
+
+# Shared by backup and verify, so the two cannot drift apart: verifying
+# something other than what is backed up would prove nothing.
+produce_all_dumps() {
+    dump_schema
+    dump_flat_tables
+    dump_partitions
+}
+
+# ===========================================================================
+# State and freshness
+# ===========================================================================
+
+state_file()   { printf '%s/mysql-backup-last-success' "$(git_dir)"; }
+mark_success() { date +%s > "$(state_file)"; }
+
+# seconds_since_success — echoes seconds, or fails: 1 never ran, 2 unreadable.
+seconds_since_success() {
+    local f v; f=$(state_file)
+    [ -f "$f" ] || return 1
+    v=$(cat "$f" 2>/dev/null) || return 2
+    case $v in ''|*[!0-9]*) return 2 ;; esac
+    printf '%s' "$(( $(date +%s) - v ))"
+}
+
+human_duration() {
+    local s=$1
+    if   [ "$s" -lt 0 ];     then printf 'a negative interval (the clock moved)'
+    elif [ "$s" -lt 60 ];    then printf '%ds' "$s"
+    elif [ "$s" -lt 3600 ];  then printf '%dm' $(( s / 60 ))
+    elif [ "$s" -lt 86400 ]; then printf '%dh %dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+    else                          printf '%dd %dh' $(( s / 86400 )) $(( s % 86400 / 3600 ))
+    fi
+}
+
+# In CREDS_IN_CONTAINER mode the credentials never leave the container, so the
+# host does not know which database it is backing up. The name is not a secret,
+# and --ignore-table and the log both need it.
+resolve_database() {
+    [ -z "$DB_NAME" ] || return 0
+    DB_NAME=$(db_query "SELECT DATABASE()")
+    [ -n "$DB_NAME" ] && [ "$DB_NAME" != NULL ] || \
+        die "$EX_CONFIG" "this connection has no default database; set DB_NAME"
+}
+
+prepare_workspace() {
+    WORK_TMP="$(git_dir)/mysql-backup-tmp"
+    # Scratch files live outside the working tree. Inside it, a run killed by
+    # the OOM killer or a reboot would leave a half-written dump that the next
+    # `git add -A` commits and that no cleanup ever removes.
+    rm -rf "$WORK_TMP"; mkdir -p "$WORK_TMP"
+}
+
+# ensure_dirs <root> — the directories must exist before `git add` names them,
+# or a configuration with no plain tables at all fails on every single run with
+# "pathspec did not match any files".
+ensure_dirs() {
+    local root=$1 i
+    mkdir -p "$root/$DATA_DIR"
+    for i in "${!PART_DIR[@]}"; do mkdir -p "$root/${PART_DIR[$i]}"; done
+}
+
+tracked_dirs() {
+    printf '%s\n' "$DATA_DIR"
+    local i
+    for i in "${!PART_DIR[@]}"; do printf '%s\n' "${PART_DIR[$i]}"; done
+}
+
+# ===========================================================================
+# Commands
+# ===========================================================================
+
+connect_or_die() {
+    db_query "SELECT 1" >/dev/null 2>&1 || die "$EX_FAIL" "cannot reach the database"
+    resolve_database
+}
+
+cmd_backup() {
+    git_setup
+    git_preflight
+    acquire_lock
+    connect_or_die
+    classify_tables
+    prepare_workspace
+    ensure_dirs "$REPO"
+    log "backing up '$DB_NAME' into $REPO"
+
+    # Paths in the configuration are relative to the repository.
+    cd "$REPO"
+    produce_all_dumps
+
+    local -a dirs=()
+    local d
+    while IFS= read -r d; do dirs+=("$d"); done < <(tracked_dirs)
+    remove_orphans "${dirs[@]}"
+    rm -rf "$WORK_TMP"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "dry run: files written, nothing committed"
+        return "$EX_OK"
+    fi
+
+    local rc=0
+    git_commit "$SCHEMA_FILE" "${dirs[@]}" || rc=$?
+    case $rc in
+        0|10) ;;
+        *) die "$EX_FAIL" "commit failed" ;;
+    esac
+
+    # Pushed even when nothing was committed: an earlier run may have committed
+    # and then failed to push, and that backlog must not sit here unnoticed.
+    git_push || die "$EX_FAIL" "push failed"
+    git_maintain
+    mark_success
+}
+
+cmd_verify() {
+    git_preflight
+    acquire_lock
+    connect_or_die
+    classify_tables
+
+    local work a b
+    work=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf $(printf '%q' "$work")" EXIT
+    a="$work/a"; b="$work/b"
+
+    prepare_workspace
+    NO_SKIP=1   # skipping stable partitions would defeat the comparison
+
+    local pass
+    for pass in "$a" "$b"; do
+        mkdir -p "$pass"; ensure_dirs "$pass"
+        ( cd "$pass" && EXPECTED=() && produce_all_dumps ) > /dev/null
+    done
+    rm -rf "$WORK_TMP"
+
+    log "comparing two independent dumps of '$DB_NAME'"
+    if diff -r "$a" "$b" > "$work/diff" 2>&1; then
+        log "DETERMINISTIC: the two dumps are byte-identical"
+        return "$EX_OK"
+    fi
+
+    warn "the two dumps differ. Either the dump is not deterministic — in which"
+    warn "case every backup stores a full copy instead of a diff — or the"
+    warn "database was written to between the two passes. Re-run against a quiet"
+    warn "database or a replica; if it still differs, it is the dump."
+    head -40 "$work/diff" >&2
+    return "$EX_VALIDATION"
+}
+
+cmd_check_fresh() {
+    [ -n "$FRESHNESS" ] || \
+        die "$EX_CONFIG" "check-fresh needs a deadline: set FRESHNESS in the config"
+    git_in_repo rev-parse --git-dir >/dev/null 2>&1 || \
+        die "$EX_CONFIG" "not a git repository: $REPO"
+
+    local age rc=0
+    age=$(seconds_since_success) || rc=$?
+    case $rc in
+        1) printf 'STALE: no successful backup has ever been recorded\n'
+           notify "backup of $REPO has never succeeded"; exit "$EX_STALE" ;;
+        2) printf 'STALE: the last-success marker is unreadable\n'
+           notify "backup of $REPO has an unreadable state file"; exit "$EX_STALE" ;;
+    esac
+
+    if [ "$age" -gt "$FRESHNESS" ]; then
+        printf 'STALE: last successful run %s ago, limit %s\n' \
+            "$(human_duration "$age")" "$(human_duration "$FRESHNESS")"
+        notify "backup of $REPO is stale: $(human_duration "$age") since the last success"
+        exit "$EX_STALE"
+    fi
+
+    # The commit age is reported for context only. It is not a health signal: a
+    # database that legitimately did not change produces no commit, and that is
+    # not a broken backup.
+    local cage
+    if cage=$(git_commit_age); then
+        printf 'FRESH: last successful run %s ago, newest data %s old\n' \
+            "$(human_duration "$age")" "$(human_duration "$cage")"
+    else
+        printf 'FRESH: last successful run %s ago\n' "$(human_duration "$age")"
+    fi
+}
+
+cmd_doctor() {
+    printf 'tool          %s\n' "$VERSION"
+    printf 'connection    %s\n' "$([ "$BACKEND" = native ] && printf 'local client' || printf 'docker exec %s' "$DB_CONTAINER")"
+    printf 'credentials   %s\n' "$CREDS"
+    printf 'repository    %s\n' "$REPO"
+
+    git_setup
+    git_preflight
+    printf 'repository    ok, on branch %s\n' "$(git_current_branch)"
+
+    if db_query "SELECT 1" >/dev/null 2>&1; then
+        resolve_database
+        printf 'database      %s, %s tables\n' "$DB_NAME" "$(db_tables | grep -c . || true)"
+    else
+        printf 'database      UNREACHABLE\n'
+    fi
+
+    printf 'loose objects %s (packed at %s)\n' "$(git_loose_count)" "$GC_LOOSE_LIMIT"
+
+    local branch here there
+    branch=${BRANCH:-$(git_current_branch)}
+    here=$(git_head_sha)
+    there=$(git_in_repo ls-remote "$REMOTE" "refs/heads/$branch" 2>/dev/null | cut -f1 || printf '')
+    if [ -z "$here" ]; then printf 'remote        no commits yet\n'
+    elif [ "$here" = "$there" ]; then printf 'remote        in sync\n'
+    else printf 'remote        OUT OF SYNC (local %s, remote %s)\n' "${here:0:8}" "${there:0:8}"
+    fi
+
+    local age rc=0
+    age=$(seconds_since_success) || rc=$?
+    case $rc in
+        0) printf 'last success  %s ago\n' "$(human_duration "$age")" ;;
+        1) printf 'last success  never recorded\n' ;;
+        2) printf 'last success  marker unreadable\n' ;;
+    esac
+}
+
+# init — create and wire up the backup repository.
+#
+# Doing this by hand is four commands that must all be right, repeated once per
+# database. Getting the branch or the key wrong is not noticed until the first
+# push fails, which on a nightly job means tomorrow.
+cmd_init() {
+    local branch=${BRANCH:-main}
+
+    if [ -d "$REPO/.git" ]; then
+        log "repository already exists: $REPO"
+    else
+        mkdir -p "$REPO"
+        git init -q "$REPO"
+        log "created repository $REPO"
+    fi
+
+    # Set the branch name before the first commit, so the repository starts on
+    # the branch the config asks for instead of whatever git defaults to.
+    if [ -z "$(git_head_sha)" ]; then
+        git_in_repo symbolic-ref HEAD "refs/heads/$branch"
+        log "branch $branch"
+    fi
+
+    git_setup
+    [ -z "$SSH_KEY" ] || log "deploy key $SSH_KEY"
+
+    if [ -n "$REMOTE_URL" ]; then
+        if git_in_repo remote get-url "$REMOTE" >/dev/null 2>&1; then
+            git_in_repo remote set-url "$REMOTE" "$REMOTE_URL"
+        else
+            git_in_repo remote add "$REMOTE" "$REMOTE_URL"
+        fi
+        log "remote $REMOTE -> $REMOTE_URL"
+        if git_in_repo ls-remote "$REMOTE" >/dev/null 2>&1; then
+            log "remote is reachable"
+        else
+            warn "the remote is not reachable yet. If it is a deploy key, check it has write access."
+        fi
+    elif ! git_in_repo remote get-url "$REMOTE" >/dev/null 2>&1; then
+        warn "no remote configured. Set REMOTE_URL in the config and run init again,"
+        warn "or the backup will never leave this machine."
+    fi
+
+    ensure_dirs "$REPO"
+    log "ready — run 'mysql-backup doctor' next, then 'backup'"
+}
+
+cmd_gc() {
+    git_preflight
+    acquire_lock
+    git_maintain force
+}
+
+usage() {
+    cat <<'TXT'
+mysql-backup — MySQL/MariaDB backups kept as a git history
+
+USAGE
+    mysql-backup <command> <config> [options]
+
+COMMANDS
+    init         Create the backup repository and wire up its remote and key.
+    backup       Dump, commit and push. The normal cron entry point.
+    verify       Dump twice and prove the output is identical. Determinism is
+                 what keeps the repository small; this is how you check it.
+    check-fresh  Report time since the last successful run; exits non-zero once
+                 FRESHNESS has passed. Point your monitoring at this.
+    doctor       Configuration, connectivity and repository health.
+    gc           Repack the repository now.
+    help         This text.
+
+OPTIONS
+    --no-skip      Re-dump every partition, including stable ones.
+    --dry-run      Write the files but do not commit or push.
+    --allow-prune  Permit a large deletion of files no longer in the database.
+
+EXIT CODES
+    0  success (also: another run holds the lock, or nothing changed)
+    1  failure          3  a dump failed validation
+    2  bad config       4  freshness deadline missed (check-fresh)
+TXT
+}
+
+NO_SKIP=0
+DRY_RUN=0
+ALLOW_PRUNE=0
+
+main() {
+    local command=${1:-help}
+    case $command in
+        help|-h|--help)    usage; exit "$EX_OK" ;;
+        version|--version) printf 'mysql-backup %s\n' "$VERSION"; exit "$EX_OK" ;;
+    esac
+    shift
+
+    local config=${1:-}
+    [ -n "$config" ] || { usage >&2; die "$EX_CONFIG" "'$command' needs a config file"; }
+    shift
+
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --no-skip)     NO_SKIP=1 ;;
+            --dry-run)     DRY_RUN=1 ;;
+            --allow-prune) ALLOW_PRUNE=1 ;;
+            *) usage >&2; die "$EX_CONFIG" "unknown option '$1'" ;;
+        esac
+        shift
+    done
+
+    load_config "$config"
+
+    case $command in
+        init)        cmd_init ;;
+        backup)      cmd_backup ;;
+        verify)      cmd_verify ;;
+        check-fresh) cmd_check_fresh ;;
+        doctor)      cmd_doctor ;;
+        gc)          cmd_gc ;;
+        *) usage >&2; die "$EX_CONFIG" "unknown command '$command'" ;;
+    esac
+}
+
+main "$@"
