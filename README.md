@@ -299,3 +299,7 @@ Keep config files out of version control. The shipped `.gitignore` excludes
 - The tool never rewrites history, so the repository grows for as long as you
   keep it. With deterministic dumps that growth is proportional to how much your
   data actually changes, which is the intent.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
