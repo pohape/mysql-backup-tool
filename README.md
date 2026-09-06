@@ -53,20 +53,48 @@ location, and every path it touches comes from the config.
 
 ```
 ~/GitHub/mysql-backup-tool/   one clone, all databases
-~/backup-configs/shop.conf    one config per database
-~/backup-configs/crm.conf
+~/GitHub/shop/backup.conf     the config, living with the project it backs up
+~/GitHub/crm/backup.conf
 ~/backups/shop/               one repository per database
 ~/backups/crm/
 ```
 
 ```cron
-17 4 * * *  ~/GitHub/mysql-backup-tool/mysql-backup backup      ~/backup-configs/shop.conf >> ~/logs/shop-backup.log 2>&1
-23 4 * * *  ~/GitHub/mysql-backup-tool/mysql-backup backup      ~/backup-configs/crm.conf  >> ~/logs/crm-backup.log  2>&1
- 0 */6 * * * ~/GitHub/mysql-backup-tool/mysql-backup check-fresh ~/backup-configs/shop.conf
+17 4 * * *  ~/GitHub/mysql-backup-tool/mysql-backup backup      ~/GitHub/shop/backup.conf >> ~/logs/shop-backup.log 2>&1
+23 4 * * *  ~/GitHub/mysql-backup-tool/mysql-backup backup      ~/GitHub/crm/backup.conf  >> ~/logs/crm-backup.log  2>&1
+ 0 */6 * * * ~/GitHub/mysql-backup-tool/mysql-backup check-fresh ~/GitHub/shop/backup.conf
 ```
+
+**Commit the config to the project it backs up.** It holds no secrets — only
+the path of the `.env` and the names of the keys to read from it — and keeping
+it there means the table list changes in the same commit as the migration that
+added the table. Two rules make that safe: never write a password into the
+config, and write paths relative to `$HOME` so the file still means the same
+thing on the next machine.
 
 Give each database its own remote repository. Sharing one between two databases
 means two writers on one branch, and every push after the first is rejected.
+
+### Pushing to a separate account
+
+A deploy key belongs to a repository, not to an account, so backups can be
+pushed into an account entirely separate from the one holding your code, with
+no shared credentials: generate a key on the server, add it to the backup
+repository with write access, and name it in the config.
+
+```sh
+ssh-keygen -t ed25519 -f ~/.ssh/shop_backup_deploy -N '' -C "$(hostname)-shop-backup"
+# add the .pub to the backup repository -> Settings -> Deploy keys -> Allow write access
+```
+
+```sh
+SSH_KEY="$HOME/.ssh/shop_backup_deploy"
+REMOTE_URL=git@github.com:backup-account/shop-backup.git
+```
+
+If that separate account exists only to receive backups, GitHub asks that it be
+a *machine account*: their terms allow one free personal account plus one free
+machine account, used exclusively for automated tasks.
 
 ## Quick start
 
