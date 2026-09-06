@@ -403,22 +403,6 @@ does not force-push, ever. A rejected push is reported as an error for a human
 to resolve, because on an append-only receiver a force push is precisely the
 operation an attacker needs.
 
-## What lands in the repository
-
-Only the dumps, plus a commit author and a subject line. Both are neutral by
-default and configurable, because they are the only strings this tool writes
-into a repository that other systems will read:
-
-```sh
-COMMIT_NAME="db-sync"
-COMMIT_EMAIL="db-sync@localhost"
-COMMIT_PREFIX="sync"        # subject becomes "sync: 20 files changed, ..."
-```
-
-The subject carries the diffstat rather than a date, because the date is
-already in the commit metadata and the one line available is better spent
-saying what changed.
-
 ## Credentials
 
 The password is never passed as a command-line argument — not to `mysqldump`,

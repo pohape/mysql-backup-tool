@@ -51,13 +51,6 @@ REMOTE=origin
 BRANCH=
 SSH_KEY=                # a dedicated deploy key, configured in the repository
 SSH_OPTIONS=            # extra ssh options, e.g. "-p 22" or a ProxyCommand
-
-# What lands inside the repository: the commit author and the subject prefix.
-# Deliberately neutral, and configurable, because these are the only strings
-# this tool writes into a repository that other systems will read.
-COMMIT_NAME="db-sync"
-COMMIT_EMAIL="db-sync@localhost"
-COMMIT_PREFIX="sync"
 PUSH_RETRIES=3
 
 # --- layout ----------------------------------------------------------------
@@ -592,10 +585,10 @@ git_current_branch() { git_in_repo symbolic-ref --short -q HEAD; }
 git_head_sha()       { git_in_repo rev-parse --verify --quiet HEAD || true; }
 
 git_setup() {
-    # Set, not defaulted: the identity is a setting of this tool now, so
-    # changing it in the config has to reach a repository that already exists.
-    git_in_repo config user.name  "$COMMIT_NAME"
-    git_in_repo config user.email "$COMMIT_EMAIL"
+    # A plain identity, set rather than defaulted so it also corrects a
+    # repository created by an earlier version.
+    git_in_repo config user.name  "db-sync"
+    git_in_repo config user.email "db-sync@localhost"
     # A key named in the repository, rather than a host alias in ~/.ssh/config,
     # keeps the deployment self-contained: nothing outside this directory has
     # to be edited for the push to work.
@@ -670,7 +663,7 @@ git_commit() {
     local stat; stat=$(git_in_repo diff --cached --shortstat | sed 's/^ *//')
     # The date is already in the commit metadata; repeating it in the subject
     # wastes the one line that could say what actually changed.
-    git_in_repo commit -q -m "${COMMIT_PREFIX}: $stat" || return 1
+    git_in_repo commit -q -m "sync: $stat" || return 1
     log "committed: $stat"
 }
 
@@ -1283,7 +1276,7 @@ cmd_init() {
     # An empty first commit gives `push --dry-run` something to negotiate, so
     # doctor can prove write access before the first real backup exists.
     if [ -z "$(git_head_sha)" ]; then
-        git_in_repo commit -q --allow-empty -m "${COMMIT_PREFIX}: initialise repository"
+        git_in_repo commit -q --allow-empty -m "sync: initialise repository"
         log "created the initial commit"
     fi
 
