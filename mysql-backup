@@ -1219,6 +1219,60 @@ check_partitions() {
     done
 }
 
+# init — create and wire up the backup repository.
+#
+# By hand this is four commands that must all be right, repeated once per
+# database. Getting the branch or the key wrong is not noticed until the first
+# push fails, which on a nightly job means tomorrow.
+cmd_init() {
+    local branch=${BRANCH:-main}
+
+    if [ -d "$REPO/.git" ]; then
+        log "repository already exists: $REPO"
+    else
+        mkdir -p "$REPO"
+        git init -q "$REPO"
+        log "created repository $REPO"
+    fi
+
+    # Set the branch before the first commit, so the repository starts on the
+    # branch the config asks for rather than whatever git defaults to.
+    if [ -z "$(git_head_sha)" ]; then
+        git_in_repo symbolic-ref HEAD "refs/heads/$branch"
+        log "branch $branch"
+    fi
+
+    git_setup
+    [ -z "$SSH_KEY" ] || log "deploy key $SSH_KEY"
+
+    if [ -n "$REMOTE_URL" ]; then
+        if git_in_repo remote get-url "$REMOTE" >/dev/null 2>&1; then
+            git_in_repo remote set-url "$REMOTE" "$REMOTE_URL"
+        else
+            git_in_repo remote add "$REMOTE" "$REMOTE_URL"
+        fi
+        log "remote $REMOTE -> $REMOTE_URL"
+        if git_in_repo ls-remote "$REMOTE" >/dev/null 2>&1; then
+            log "remote is reachable"
+        else
+            warn "the remote is not reachable yet. If it is a deploy key, check it has write access."
+        fi
+    elif ! git_in_repo remote get-url "$REMOTE" >/dev/null 2>&1; then
+        warn "no remote configured. Set REMOTE_URL in the config and run init again,"
+        warn "or the backup will never leave this machine."
+    fi
+
+    # An empty first commit gives `push --dry-run` something to negotiate, so
+    # doctor can prove write access before the first real backup exists.
+    if [ -z "$(git_head_sha)" ]; then
+        git_in_repo commit -q --allow-empty -m "init: backup repository"
+        log "created the initial commit"
+    fi
+
+    ensure_dirs "$REPO"
+    log "ready — run 'mysql-backup doctor' next, then 'backup'"
+}
+
 cmd_gc() {
     git_preflight
     acquire_lock
