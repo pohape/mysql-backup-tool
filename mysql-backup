@@ -474,9 +474,9 @@ canonicalise() {
     mv -f "$tmp" "$file"
 }
 
-# validate_dump <file> <rows: any|required>
+# validate_dump <file>
 validate_dump() {
-    local file=$1 rows=$2
+    local file=$1
 
     [ -s "$file" ] || { warn "dump is empty: $file"; return 1; }
 
@@ -494,24 +494,22 @@ validate_dump() {
         return 1
     fi
 
-    # A partition key came from the database, so rows for it exist. A dump with
-    # none means the WHERE clause stopped matching — a broken backup that would
-    # otherwise validate perfectly.
-    if [ "$rows" = required ] && ! grep -qF 'INSERT INTO' "$file"; then
-        warn "partition dump contains no rows, but its key came from the database: $file"
-        return 1
-    fi
     return 0
 }
 
-# dump_to <destination> <rows: any|required> <dump-args...>
+# Does this dump carry any rows? Used to tell a legitimately empty partition
+# from a --where clause that has stopped matching. Not a validity test on its
+# own: emptiness is only suspicious when it is true of EVERY partition.
+dump_has_rows() { grep -qF 'INSERT INTO' "$1"; }
+
+# dump_to <destination> <dump-args...>
 #
 # Writes to scratch space outside the working tree, canonicalises, validates,
 # and only then moves the file into place. Nothing that fails can replace a
 # good backup, and nothing half-written is ever visible to git.
 dump_to() {
-    local dest rows tmp
-    dest=$(norm_path "$1"); rows=$2; shift 2
+    local dest tmp
+    dest=$(norm_path "$1"); shift
 
     if [ -n "${EXPECTED[$dest]:-}" ]; then
         die "$EX_CONFIG" "two sources both write '$dest'; make the --list query return unique names"
@@ -523,7 +521,7 @@ dump_to() {
         rm -f "$tmp"; warn "dump failed for $dest (previous version kept)"; return 1
     fi
     # Validated first, while the completion marker is still there.
-    if ! validate_dump "$tmp" "$rows"; then
+    if ! validate_dump "$tmp"; then
         rm -f "$tmp"; return 1
     fi
     if ! canonicalise "$tmp"; then
@@ -787,7 +785,7 @@ dump_schema() {
     local t
     for t in "${!EXCLUDED[@]}"; do args+=("--ignore-table=${DB_NAME}.${t}"); done
 
-    dump_to "$SCHEMA_FILE" any "${args[@]}" || die "$EX_VALIDATION" \
+    dump_to "$SCHEMA_FILE" "${args[@]}" || die "$EX_VALIDATION" \
         "schema dump failed${DUMP_EVENTS:+ (if the user lacks the EVENT privilege, set DUMP_EVENTS=0)}"
 }
 
@@ -814,7 +812,7 @@ dump_flat_tables() {
 
         safe=$(sanitise_name "$t") || die "$EX_CONFIG" \
             "table name '$t' cannot be used as a filename; exclude it explicitly"
-        dump_to "$DATA_DIR/${safe}.sql" any --no-create-info -- "$t" \
+        dump_to "$DATA_DIR/${safe}.sql" --no-create-info -- "$t" \
             || die "$EX_VALIDATION" "dump of table '$t' failed"
     done <<< "$tables"
 
@@ -842,7 +840,7 @@ dump_partitions() {
 
         rows=$(db_query "$list") || die "$EX_FAIL" "the --list query for '$table' failed"
 
-        local dumped=0 skipped=0
+        local dumped=0 skipped=0 empty=0 with_rows=0
         while IFS=$'\t' read -r kval name; do
             [ -n "$kval" ] && [ "$kval" != NULL ] || continue
             [ -n "${name:-}" ] || name=$kval
@@ -858,12 +856,27 @@ dump_partitions() {
                 expect "$dest"; skipped=$(( skipped + 1 )); continue
             fi
 
-            dump_to "$dest" required --no-create-info --where="${key} = $(sql_quote "$kval")" -- "$table" \
+            dump_to "$dest" --no-create-info --where="${key} = $(sql_quote "$kval")" -- "$table" \
                 || die "$EX_VALIDATION" "dump of partition '$name' of table '$table' failed"
             dumped=$(( dumped + 1 ))
+            if dump_has_rows "$dest"; then
+                with_rows=$(( with_rows + 1 ))
+            else
+                empty=$(( empty + 1 ))
+            fi
         done <<< "$rows"
 
-        log "$table: $dumped dumped, $skipped unchanged"
+        # An empty partition is normal: a session can exist before it has a
+        # single task, and 60 of them did on the day this check first fired.
+        # What is not normal is EVERY partition coming out empty while the
+        # table itself holds rows — that is a --where clause that has stopped
+        # matching, the failure this guard was written for.
+        if [ "$dumped" -gt 0 ] && [ "$with_rows" -eq 0 ] \
+           && [ "$(db_query "SELECT COUNT(*) FROM \`$table\`")" != 0 ]; then
+            die "$EX_VALIDATION" "every partition of '$table' dumped empty while the table has rows: the --where clause on '$key' no longer matches"
+        fi
+
+        log "$table: $dumped dumped ($empty empty), $skipped unchanged"
     done
 }
 
