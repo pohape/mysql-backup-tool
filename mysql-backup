@@ -1023,11 +1023,32 @@ cmd_verify() {
         return "$EX_OK"
     fi
 
-    warn "the two dumps differ. Either the dump is not deterministic — in which"
-    warn "case every backup stores a full copy instead of a diff — or the"
-    warn "database was written to between the two passes. Re-run against a quiet"
-    warn "database or a replica; if it still differs, it is the dump."
-    head -40 "$work/diff" >&2
+    # Which files differ matters more than the first forty lines of diff: on a
+    # live database a handful of counter columns march forward while every
+    # partition stays identical, and that reads as "differ" too. Naming the
+    # files lets the operator tell those two apart in one glance.
+    local -a changed=()
+    while IFS= read -r f; do changed+=("$f"); done < <(
+        diff -rq "$a" "$b" 2>/dev/null | sed -n 's/^Files .*\/a\/\(.*\) and .* differ$/\1/p'
+        diff -rq "$a" "$b" 2>/dev/null | sed -n 's/^Only in .*: \(.*\)$/только в одном проходе: \1/p'
+    )
+
+    warn "the two dumps differ in ${#changed[@]} file(s). Either the dump is not"
+    warn "deterministic — in which case every backup stores a full copy instead of"
+    warn "a diff — or the database was written to between the two passes."
+    local f
+    for f in "${changed[@]}"; do warn "  $f"; done
+
+    # The temp dir is normally removed on exit. When the comparison fails it is
+    # the only evidence there is, and deleting it forces the whole 30-minute run
+    # to be repeated to answer the first follow-up question.
+    trap - EXIT
+    warn "both dumps and the full diff kept for inspection: $work"
+    warn "(diff: $work/diff — remove the directory when done)"
+    warn "On a live database this is expected: counters advance between passes."
+    warn "The honest test of determinism there is the churn of a real run —"
+    warn "if repeated dumps were not identical, every hourly commit would rewrite"
+    warn "every file instead of the few that actually changed."
     return "$EX_VALIDATION"
 }
 

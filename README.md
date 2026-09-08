@@ -145,6 +145,18 @@ Check everything before trusting it:
 ./mysql-backup backup  myapp.conf   # the real thing
 ```
 
+`verify` dumps everything twice and compares byte for byte, so it needs a
+database nobody is writing to — a maintenance window, or a replica. Run it
+against a live one and it will report a difference for an honest reason:
+counters advanced between the two passes. When that happens it now names the
+files that differ and keeps both dumps for inspection, so you can tell a
+handful of moving counters from a genuinely nondeterministic dump.
+
+On a database that is never quiet, the honest test of determinism is the churn
+of a real run. If repeated dumps were not identical, every run would rewrite
+every file; a run that touches a few dozen files out of a few thousand is that
+proof, delivered daily and for free.
+
 ## Choosing which tables
 
 By default every table is backed up and you name the exceptions:
