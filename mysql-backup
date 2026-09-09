@@ -69,7 +69,7 @@ NOTIFY_COMMAND=
 TABLE_MODE=exclude      # exclude: back up everything but the listed tables
                         # include: back up only the listed tables
 declare -a TABLES_INCLUDE=() TABLES_EXCLUDE=() TABLES_SCHEMA_ONLY=() DUMP_EXTRA=()
-declare -a PART_TABLE=() PART_DIR=() PART_LIST=() PART_KEY=() PART_STABLE=()
+declare -a PART_TABLE=() PART_DIR=() PART_LIST=() PART_KEY=() PART_STABLE=() PART_FILTER=()
 
 # ===========================================================================
 # Config file vocabulary
@@ -105,7 +105,7 @@ table_schema_only() { TABLES_SCHEMA_ONLY+=("$@"); }
 #                        (--set-gtid-purged=OFF is MySQL-only, for instance).
 dump_option() { DUMP_EXTRA+=("$@"); }
 
-# partition <table> --dir DIR --list SQL --key COLUMN [--stable SQL]
+# partition <table> --dir DIR --list SQL --key COLUMN [--stable SQL] [--filter SQL]
 #
 # Split a table along a column whose values have a one-way lifecycle — a job
 # that finishes, an account that closes, a day that ends. Each value gets its
@@ -118,15 +118,22 @@ dump_option() { DUMP_EXTRA+=("$@"); }
 #   --stable  values that can no longer change; their files are not re-dumped.
 #             A load optimisation only — a fresh dump would be identical anyway
 #             — so nothing depends on it being right. `verify` ignores it.
+#   --filter  extra SQL condition, ANDed with the key match, that decides which
+#             ROWS of the partition are worth keeping. Unlike --stable this does
+#             change what the backup contains, so use it only where the dropped
+#             rows carry no information the backup is meant to preserve. Changing
+#             it later rewrites every partition file, and any --stable values
+#             already on disk keep their OLD content until their file is removed.
 partition() {
     local table=${1:?partition needs a table name}; shift
-    local dir="" list="" key="" stable=""
+    local dir="" list="" key="" stable="" filter=""
     while [ $# -gt 0 ]; do
         case $1 in
             --dir)    dir=$2;    shift 2 ;;
             --list)   list=$2;   shift 2 ;;
             --key)    key=$2;    shift 2 ;;
             --stable) stable=$2; shift 2 ;;
+            --filter) filter=$2; shift 2 ;;
             *) die "$EX_CONFIG" "partition $table: unknown option '$1'" ;;
         esac
     done
@@ -136,6 +143,7 @@ partition() {
 
     PART_TABLE+=("$table"); PART_DIR+=("$dir"); PART_LIST+=("$list")
     PART_KEY+=("$key");     PART_STABLE+=("$stable")
+    PART_FILTER+=("$filter")
 }
 
 # ===========================================================================
@@ -828,6 +836,7 @@ dump_partitions() {
     for i in "${!PART_TABLE[@]}"; do
         table=${PART_TABLE[$i]}; dir=${PART_DIR[$i]}; list=${PART_LIST[$i]}
         key=${PART_KEY[$i]};     stable=${PART_STABLE[$i]}
+        filter=${PART_FILTER[$i]}
         mkdir -p "$dir"
 
         local -A stable_set=()
@@ -856,7 +865,9 @@ dump_partitions() {
                 expect "$dest"; skipped=$(( skipped + 1 )); continue
             fi
 
-            dump_to "$dest" --no-create-info --where="${key} = $(sql_quote "$kval")" -- "$table" \
+            where="${key} = $(sql_quote "$kval")"
+            [ -n "$filter" ] && where="$where AND ($filter)"
+            dump_to "$dest" --no-create-info --where="$where" -- "$table" \
                 || die "$EX_VALIDATION" "dump of partition '$name' of table '$table' failed"
             dumped=$(( dumped + 1 ))
             if dump_has_rows "$dest"; then
@@ -871,9 +882,11 @@ dump_partitions() {
         # What is not normal is EVERY partition coming out empty while the
         # table itself holds rows — that is a --where clause that has stopped
         # matching, the failure this guard was written for.
+        # With --filter the count has to be taken through the same filter, or the
+        # guard fires on a table that legitimately has no matching rows at all.
         if [ "$dumped" -gt 0 ] && [ "$with_rows" -eq 0 ] \
-           && [ "$(db_query "SELECT COUNT(*) FROM \`$table\`")" != 0 ]; then
-            die "$EX_VALIDATION" "every partition of '$table' dumped empty while the table has rows: the --where clause on '$key' no longer matches"
+           && [ "$(db_query "SELECT COUNT(*) FROM \`$table\` WHERE ${filter:-1 = 1}")" != 0 ]; then
+            die "$EX_VALIDATION" "every partition of '$table' dumped empty while matching rows exist: the --where clause on '$key' no longer matches"
         fi
 
         log "$table: $dumped dumped ($empty empty), $skipped unchanged"

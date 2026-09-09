@@ -237,6 +237,33 @@ stable partitions are not re-dumped, because a fresh dump would be identical
 anyway. Nothing depends on it being right — `verify` and `--no-skip` ignore it
 entirely.
 
+#### Keeping only the rows that carry information
+
+A table can be split correctly and still be mostly noise. `--filter` adds an SQL
+condition to every partition dump, so only the rows worth keeping are written:
+
+```sh
+partition job_results --dir data/jobs \
+    --list   "SELECT id, name FROM job_runs" \
+    --key    run_id \
+    --filter "is_best = 1"
+```
+
+Unlike `--stable`, this **changes what the backup contains** — the excluded rows
+are not in the repository at all. Use it only where the dropped rows carry
+nothing the backup exists to preserve, and remember that the row count is what
+drives restore time: a table whose useful rows are 2% of the total restores
+fifty times faster.
+
+Two things to know before turning it on:
+
+- Changing the condition later rewrites every partition file, so expect one large
+  commit. Values already listed by `--stable` keep their **old** content until
+  their file is deleted, because stable files are never re-dumped.
+- The guard that fires when every partition comes out empty counts rows through
+  the same filter, so a table with no matching rows at all is not mistaken for a
+  broken `--where`.
+
 ### 3. Packing
 
 Git writes each new object as its own file and only delta-compresses when it
