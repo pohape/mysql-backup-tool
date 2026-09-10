@@ -116,8 +116,24 @@ dump_option() { DUMP_EXTRA+=("$@"); }
 #   --list    two columns: the value to match, and the filename stem
 #   --key     the column in <table> holding that value
 #   --stable  values that can no longer change; their files are not re-dumped.
-#             A load optimisation only — a fresh dump would be identical anyway
-#             — so nothing depends on it being right. `verify` ignores it.
+#             `verify` ignores it.
+#
+#             READ THIS BEFORE WRITING THE QUERY. It is tempting to call this a
+#             load optimisation on the grounds that a fresh dump would be
+#             identical anyway. That is only true if the condition really does
+#             mean "no further rows will ever arrive for this value". If it can
+#             become true a moment BEFORE the last row lands, the file is frozen
+#             with the row missing and no later run will ever revisit it — the
+#             backup then silently and permanently lacks data the database has.
+#             Seen in the field: a session marked 'converged' when its stopping
+#             criterion was met, while trials already in flight kept writing for
+#             minutes afterwards; the dump landed in that gap and the best result
+#             of the whole session never reached the backup.
+#             So the condition must be one that becomes true strictly AFTER the
+#             final write — typically "finished AND nothing still in flight AND
+#             quiet for longer than the interval between runs".
+#             Recovering from a bad one: delete the affected files and run again
+#             (the skip only applies to a file that already exists), or --no-skip.
 #   --filter  extra SQL condition, ANDed with the key match, that decides which
 #             ROWS of the partition are worth keeping. Unlike --stable this does
 #             change what the backup contains, so use it only where the dropped
@@ -400,6 +416,38 @@ _run_client() {
 }
 
 db_query() { _run_client "$CLIENT_BIN" -N -B -e "$1" @DB@; }
+
+# _feed_client — like _run_client, but standard input reaches the client and no
+# timeout is imposed. Restoring is the one operation that legitimately runs for
+# a long time and legitimately reads a stream, so it needs its own path rather
+# than a flag on _run_client, whose whole contract is "reads nothing".
+_feed_client() {
+    local x
+    if [ "$BACKEND" = native ]; then
+        MYSQL_PWD="$DB_PASSWORD" "$CLIENT_BIN" \
+            -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER" "$DB_NAME"
+        return
+    fi
+
+    local dbexpr uexpr auth
+    if [ "$CREDS" = container ]; then
+        dbexpr="\"\$${CONTAINER_DATABASE_VAR}\""
+        uexpr="\"\$${CONTAINER_USER_VAR}\""
+        auth="export MYSQL_PWD=\"\$${CONTAINER_PASSWORD_VAR}\"; "
+    else
+        dbexpr=$(_shq "$DB_NAME")
+        uexpr=$(_shq "$DB_USER")
+        auth=''
+    fi
+
+    local cmd="${auth}exec $(_shq "$CLIENT_BIN") -u${uexpr} $dbexpr"
+    if [ "$CREDS" = container ]; then
+        docker exec -i "$DB_CONTAINER" sh -c "$cmd"
+    else
+        MYSQL_PWD="$DB_PASSWORD" docker exec -i -e MYSQL_PWD "$DB_CONTAINER" sh -c "$cmd"
+    fi
+}
+
 
 db_dump() {
     local -a opts=() tables=()
@@ -1348,6 +1396,95 @@ cmd_gc() {
     git_maintain force
 }
 
+# ===========================================================================
+# Restore
+# ===========================================================================
+#
+# Why this is a command and not a paragraph in a README.
+#
+# A partitioned backup is thousands of small files, and every one of them
+# carries a full mysqldump preamble: ten `/*!... SET ...*/` directives and a
+# DISABLE KEYS / ENABLE KEYS pair. Fed back naively that is enormously more
+# work than the data itself. Measured on a real backup of 2805 files holding
+# 33 372 INSERT statements: the stream contains 95 082 statements, of which
+# 56 100 are repeated preamble and 5 610 are `ALTER TABLE`. `ALTER TABLE`
+# implicitly commits, so each one costs a disk sync — that alone is half the
+# time. Loading the same content as one preamble plus the INSERT lines took
+# 47 seconds against 15-20 minutes, and `CHECKSUM TABLE` on every table
+# matched exactly.
+#
+# That difference belongs in the tool. A restore happens once, under pressure,
+# from a runbook someone is reading for the first time — precisely the moment
+# not to be assembling shell pipelines by hand.
+#
+# What is dropped, and why it is safe: `DISABLE KEYS` does nothing at all on
+# InnoDB (it is a MyISAM feature), and the session directives are emitted once
+# instead of once per file — taken verbatim from the dump itself, not invented
+# here, so a change in dump settings carries over on its own.
+
+# The session directives every dump file sets, taken from the file rather than
+# hard-coded: everything from the head of the file up to its first statement.
+restore_preamble() {
+    local file=$1
+    sed -n '1,/^INSERT INTO/p' "$file" | grep -E '^/\*!' || true
+    printf 'SET autocommit=0;\n'
+}
+
+cmd_restore() {
+    local target=${RESTORE_INTO:-$DB_NAME}
+    [ -n "$target" ] || die "$EX_CONFIG" "restore needs a target database: none in the config, and no --into given"
+    DB_NAME=$target
+
+    local schema="$REPO/$SCHEMA_FILE"
+    [ -f "$schema" ] || die "$EX_CONFIG" "no schema file at $schema — is $REPO a backup repository?"
+
+    # Every data file, in the same order a manual restore would use.
+    local -a files=()
+    local f d
+    for d in "${PART_DIR[@]}"; do
+        [ -d "$REPO/$d" ] || continue
+        while IFS= read -r f; do files+=("$f"); done < <(find "$REPO/$d" -name '*.sql' -type f | sort)
+    done
+    while IFS= read -r f; do files+=("$f"); done \
+        < <(find "$REPO/$DATA_DIR" -maxdepth 1 -name '*.sql' -type f 2>/dev/null | sort)
+    [ "${#files[@]}" -gt 0 ] || die "$EX_CONFIG" "no data files found under $REPO/$DATA_DIR"
+
+    # Refuse to overwrite a database that already has tables. schema.sql opens
+    # with DROP TABLE for every one of them, so "already has tables" and
+    # "about to destroy data" are the same sentence.
+    local existing
+    existing=$(db_query "SELECT COUNT(*) FROM information_schema.tables
+                         WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'") \
+        || die "$EX_FAIL" "cannot reach the target database '$target'"
+    if [ "$existing" != 0 ] && [ "$FORCE" -eq 0 ]; then
+        die "$EX_CONFIG" "database '$target' already holds $existing table(s); \
+the schema file drops every table it recreates. Restore into an empty database, \
+or pass --force if overwriting this one is the intention."
+    fi
+
+    log "restore: target '$target' on ${DB_HOST:-container}, $((${#files[@]})) data file(s) from $REPO"
+    if [ "$ASSUME_YES" -eq 0 ]; then
+        die "$EX_CONFIG" "restore rewrites '$target' and is not reversible; re-run with --yes to proceed"
+    fi
+
+    local t0 t1
+    t0=$(date +%s)
+    log "restore: loading schema"
+    _feed_client < "$schema" || die "$EX_FAIL" "loading the schema into '$target' failed"
+    t1=$(date +%s)
+    log "restore: schema loaded in $((t1 - t0))s"
+
+    log "restore: loading data"
+    {
+        restore_preamble "${files[0]}"
+        cat "${files[@]}" | grep '^INSERT INTO' || true
+        printf 'COMMIT;\n'
+    } | _feed_client || die "$EX_FAIL" "loading data into '$target' failed"
+    log "restore: data loaded in $(( $(date +%s) - t1 ))s"
+
+    log "restore: done in $(( $(date +%s) - t0 ))s — the derived tables are still empty by design"
+}
+
 usage() {
     cat <<'TXT'
 mysql-backup — MySQL/MariaDB backups kept as a git history
@@ -1364,12 +1501,17 @@ COMMANDS
                  that it reached the remote. Exits non-zero when it did not.
     doctor       Configuration, connectivity and repository health.
     gc           Repack the repository now.
+    restore      Load the backup back into a database. Needs --yes; refuses a
+                 database that already has tables unless --force.
     help         This text.
 
 OPTIONS
     --no-skip      Re-dump every partition, including stable ones.
     --dry-run      Write the files but do not commit or push.
     --allow-prune  Permit a large deletion of files no longer in the database.
+    --yes          restore: proceed. Without it restore only says what it would do.
+    --force        restore: overwrite a database that already has tables.
+    --into DB      restore: target this database instead of the configured one.
 
 EXIT CODES
     0  success (also: another run holds the lock, or nothing changed)
@@ -1381,6 +1523,9 @@ TXT
 NO_SKIP=0
 DRY_RUN=0
 ALLOW_PRUNE=0
+ASSUME_YES=0
+FORCE=0
+RESTORE_INTO=
 
 main() {
     local command=${1:-help}
@@ -1399,6 +1544,9 @@ main() {
             --no-skip)     NO_SKIP=1 ;;
             --dry-run)     DRY_RUN=1 ;;
             --allow-prune) ALLOW_PRUNE=1 ;;
+            --yes)         ASSUME_YES=1 ;;
+            --force)       FORCE=1 ;;
+            --into)        RESTORE_INTO=${2:-}; [ -n "$RESTORE_INTO" ] || die "$EX_CONFIG" "--into needs a database name"; shift ;;
             *) usage >&2; die "$EX_CONFIG" "unknown option '$1'" ;;
         esac
         shift
@@ -1413,6 +1561,7 @@ main() {
         status)      cmd_status ;;
         doctor)      cmd_doctor ;;
         gc)          cmd_gc ;;
+        restore)     cmd_restore ;;
         *) usage >&2; die "$EX_CONFIG" "unknown command '$command'" ;;
     esac
 }

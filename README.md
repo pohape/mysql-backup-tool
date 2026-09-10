@@ -283,10 +283,13 @@ This is not a marginal effect. In the incident that motivated the feature,
 | `status` | One line for monitoring: it ran, and it reached the remote. |
 | `doctor` | Everything that has to be true for tonight's backup to work. |
 | `gc` | Repack now, ignoring the threshold. |
+| `restore` | Load the backup back into a database. |
 
 Options: `--no-skip` re-dumps every partition; `--dry-run` writes the files but
 does not commit or push; `--allow-prune` permits a large deletion of files
-whose rows are gone from the database.
+whose rows are gone from the database. For `restore`: `--yes` proceeds,
+`--force` overwrites a database that already has tables, `--into DB` targets a
+database other than the configured one.
 
 That last one exists because deleting is the one thing that can destroy a
 backup. If a run would remove more files than it keeps, it stops and asks
@@ -414,12 +417,44 @@ try. Or from plain cron, relying on the exit code:
 
 ## Restoring
 
-The dump is ordinary SQL. Load the schema first, then the data:
+```sh
+mysql-backup restore backup.conf --yes
+```
+
+That is the whole procedure. It loads `schema.sql`, then every data file, into
+the database the config names — or into another one with `--into`, which is how
+you rehearse without touching production.
+
+It refuses to run without `--yes`, printing what it would do instead, and it
+refuses a database that already has tables unless you add `--force`: the schema
+file opens by dropping every table it recreates, so "already has tables" and
+"about to destroy data" are the same sentence.
+
+**Why a command rather than two lines of shell.** The obvious manual version is
 
 ```sh
 mysql mydb < schema.sql
 find data -name '*.sql' | sort | xargs cat | mysql mydb
 ```
+
+and it works, but on a partitioned backup it is far slower than the data
+deserves. Every one of the thousands of files carries its own mysqldump
+preamble — ten `SET` directives and a `DISABLE KEYS` / `ENABLE KEYS` pair — so
+the client replays that boilerplate once per file. Measured on a real backup of
+2805 files holding 33 372 `INSERT` statements: the stream is 95 082 statements,
+of which 56 100 are repeated preamble and 5 610 are `ALTER TABLE`. `ALTER TABLE`
+commits implicitly, so each one costs a disk sync, and the sync rate — not the
+data — sets the floor. Loading the same content as one preamble plus the
+`INSERT` lines took **47 seconds against 15-20 minutes**, with `CHECKSUM TABLE`
+matching on every table.
+
+Nothing is lost in the fast path: `DISABLE KEYS` does nothing at all on InnoDB,
+and the session directives are emitted once instead of once per file — read out
+of the dump itself rather than hard-coded here, so a change in dump settings
+carries over on its own.
+
+Derived tables listed as `table_schema_only` come back empty but present, by
+design. Whatever recomputes them has to run afterwards.
 
 Practise this before you need it. A backup you have never restored is a
 hypothesis, not a backup — and this applies to the repository you are reading
