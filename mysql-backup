@@ -1441,7 +1441,9 @@ cmd_restore() {
     # Every data file, in the same order a manual restore would use.
     local -a files=()
     local f d
-    for d in "${PART_DIR[@]}"; do
+    # ${a[@]+...} because a config may declare no partitions at all, and an
+    # empty array under `set -u` is an error on bash before 4.4.
+    for d in ${PART_DIR[@]+"${PART_DIR[@]}"}; do
         [ -d "$REPO/$d" ] || continue
         while IFS= read -r f; do files+=("$f"); done < <(find "$REPO/$d" -name '*.sql' -type f | sort)
     done
