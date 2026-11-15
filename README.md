@@ -202,9 +202,13 @@ dump date, the client and server version banners, and a table's
 Leave them in and every run rewrites the whole file — the repository then grows
 by the size of the database, every time.
 
-The tool dumps with `--skip-dump-date --order-by-primary --skip-extended-insert`
-and strips the version banners and the `AUTO_INCREMENT` marker afterwards.
+The tool dumps with `--skip-dump-date --skip-extended-insert`, orders every
+table by its primary key (or its first unique key) and strips the version
+banners and the `AUTO_INCREMENT` marker afterwards.
 (Dropping the counter is safe: on restore MySQL sets it to `MAX(id)+1`.)
+The order is given per table, not by `--order-by-primary`: with a `UNIQUE` key
+besides the primary one, mysqldump 8.4 sorts by both and one large row fails
+the dump with `Error 1038: Out of sort memory`.
 `--skip-extended-insert` puts one row per line, so a diff is "+3 rows" rather
 than one rewritten mega-statement.
 

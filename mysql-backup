@@ -360,9 +360,13 @@ validate_config() {
 # Flags every dump gets. The first three are about consistency and memory; the
 # rest are what make two dumps of unchanged data byte-identical, which is the
 # whole premise of keeping backups in git.
+#
+# Row order comes from key_order, not --order-by-primary: with a UNIQUE key
+# besides the PRIMARY one, mysqldump 8.4 sorts by both, the server sorts in
+# memory, and one row larger than sort_buffer_size fails the run (Error 1038).
 DUMP_DEFAULTS=(
     --single-transaction --quick --no-tablespaces
-    --skip-extended-insert --order-by-primary --skip-dump-date
+    --skip-extended-insert --skip-dump-date
     --default-character-set=utf8mb4
 )
 
@@ -416,6 +420,24 @@ _run_client() {
 }
 
 db_query() { _run_client "$CLIENT_BIN" -N -B -e "$1" @DB@; }
+
+# sql_ident <name> — a backquoted identifier, embedded backquotes doubled.
+sql_ident() { local s=${1//\`/\`\`}; printf '`%s`' "$s"; }
+
+# key_order <table> — "ORDER BY" over the columns of the table's first key if it
+# is unique (PRIMARY, else the first UNIQUE); empty without one. An index's own
+# columns are read in index order, never sorted in memory.
+key_order() {
+    local keys cols
+    keys=$(db_query "SHOW KEYS FROM $(sql_ident "$1")") || return 1
+    cols=$(awk -F'\t' '
+        NR == 1 { if ($2 != 0) exit; key = $3 }
+        $3 != key { exit }
+        $5 == "NULL" { bad = 1; exit }
+        { gsub(/`/, "``", $5); printf "%s`%s`", (n++ ? "," : ""), $5 }
+        END { if (bad) exit 3 }' <<< "$keys") || return 1
+    [ -z "$cols" ] || printf 'ORDER BY %s' "$cols"
+}
 
 # _feed_client — like _run_client, but standard input reaches the client and no
 # timeout is imposed. Restoring is the one operation that legitimately runs for
@@ -856,7 +878,8 @@ dump_flat_tables() {
     [ -n "$tables" ] || die "$EX_FAIL" \
         "the database reports no tables. That is either the wrong database or a user whose grants hide them; either way it is not a backup."
 
-    local -a unlisted=()
+    local -a unlisted=() where_args=()
+    local order
     while IFS= read -r t; do
         [ -n "$t" ] || continue
         [ -z "${EXCLUDED[$t]:-}" ] || continue
@@ -868,7 +891,10 @@ dump_flat_tables() {
 
         safe=$(sanitise_name "$t") || die "$EX_CONFIG" \
             "table name '$t' cannot be used as a filename; exclude it explicitly"
-        dump_to "$DATA_DIR/${safe}.sql" --no-create-info -- "$t" \
+        order=$(key_order "$t") || die "$EX_FAIL" "could not read the keys of table '$t'"
+        where_args=()
+        [ -z "$order" ] || where_args=(--where="1=1 $order")
+        dump_to "$DATA_DIR/${safe}.sql" --no-create-info ${where_args[@]+"${where_args[@]}"} -- "$t" \
             || die "$EX_VALIDATION" "dump of table '$t' failed"
     done <<< "$tables"
 
@@ -880,12 +906,13 @@ dump_flat_tables() {
 }
 
 dump_partitions() {
-    local i table dir list key stable rows stable_rows sv kval name safe dest
+    local i table dir list key stable rows stable_rows sv kval name safe dest order
     for i in "${!PART_TABLE[@]}"; do
         table=${PART_TABLE[$i]}; dir=${PART_DIR[$i]}; list=${PART_LIST[$i]}
         key=${PART_KEY[$i]};     stable=${PART_STABLE[$i]}
         filter=${PART_FILTER[$i]}
         mkdir -p "$dir"
+        order=$(key_order "$table") || die "$EX_FAIL" "could not read the keys of table '$table'"
 
         local -A stable_set=()
         if [ -n "$stable" ] && [ "$NO_SKIP" -eq 0 ]; then
@@ -915,6 +942,7 @@ dump_partitions() {
 
             where="${key} = $(sql_quote "$kval")"
             [ -n "$filter" ] && where="$where AND ($filter)"
+            [ -n "$order" ] && where="$where $order"
             dump_to "$dest" --no-create-info --where="$where" -- "$table" \
                 || die "$EX_VALIDATION" "dump of partition '$name' of table '$table' failed"
             dumped=$(( dumped + 1 ))
