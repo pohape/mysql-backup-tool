@@ -1467,7 +1467,7 @@ cmd_gc() {
 # hard-coded: everything from the head of the file up to its first statement.
 restore_preamble() {
     local file=$1
-    sed -n '1,/^INSERT INTO/p' "$file" | grep -E '^/\*!' || true
+    sed -n '1,/^INSERT INTO/p' "$file" | LC_ALL=C grep -a -E '^/\*!' || true
     printf 'SET autocommit=0;\n'
 }
 
@@ -1520,7 +1520,10 @@ or pass --force if overwriting this one is the intention."
     log "restore: loading data"
     {
         restore_preamble "${files[0]}"
-        cat "${files[@]}" | grep '^INSERT INTO' || true
+        # Byte-wise, and never "binary file matches": a BINARY/BLOB column is dumped as raw
+        # bytes, and grep in a UTF-8 locale then stops printing lines at the first invalid
+        # sequence — on 19.11.2026 a restore loaded 8 575 of 166 677 rows and exited 0.
+        cat "${files[@]}" | LC_ALL=C grep -a '^INSERT INTO' || true
         printf 'COMMIT;\n'
     } | _feed_client || die "$EX_FAIL" "loading data into '$target' failed"
     log "restore: data loaded in $(( $(date +%s) - t1 ))s"
