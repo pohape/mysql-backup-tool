@@ -284,7 +284,7 @@ This is not a marginal effect. In the incident that motivated the feature,
 |---|---|
 | `backup` | Dump, commit, push. The cron entry point. |
 | `verify` | Dump twice, prove the output is identical. |
-| `status` | One line for monitoring: it ran, and it reached the remote. |
+| `status` | One line for monitoring: it ran, it reached the remote, no file is near the git host's size limit. |
 | `doctor` | Everything that has to be true for tonight's backup to work. |
 | `gc` | Repack now, ignoring the threshold. |
 | `restore` | Load the backup back into a database. |
@@ -378,7 +378,7 @@ $ ./mysql-backup status myapp.conf
 BACKUP OK: last run 42m ago, pushed to origin/main
 ```
 
-It checks two things, because freshness alone is not enough. A run can dump,
+It checks three things, because freshness alone is not enough. A run can dump,
 validate and commit perfectly and still fail to push — and then the backup
 exists only on the machine it is meant to protect, while every freshness check
 says all is well. So `status` also confirms the local branch matches the
@@ -388,6 +388,16 @@ remote:
 BACKUP PROBLEM: 3 commit(s) not pushed to origin/main — the backup has not left this machine
 BACKUP PROBLEM: last successful run 3d 4h ago, limit 1d 0h
 BACKUP PROBLEM: no successful run has ever been recorded
+```
+
+The third is the size of every file in the backup. GitHub refuses a push that
+contains a file over 100 MiB, and a table dumped into one file grows quietly
+until the night it crosses that line. `FILE_SIZE_LIMIT_MB` (default 80, `0`
+turns it off) makes `status` report the largest file first, while there is
+still room to split the table with a `partition`:
+
+```
+BACKUP PROBLEM: data/events.sql is 83 MB, limit 80 MB (FILE_SIZE_LIMIT_MB): split the table with a partition before the git host refuses the push
 ```
 
 It measures the last successful *run*, not the last commit: a database that

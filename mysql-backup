@@ -64,6 +64,10 @@ GC_LOOSE_LIMIT=500      # pack once this many loose objects accumulate
 ORPHAN_LIMIT=20         # refuse to delete more than this without --allow-prune
 DUMP_EVENTS=1           # scheduled events are part of the schema
 NOTIFY_COMMAND=
+FILE_SIZE_LIMIT_MB=80   # `status` reports a problem once any backup file is larger;
+                        # 0 turns the check off. GitHub refuses a file over 100 MiB
+                        # and warns over 50 MiB, so a growing table must be split
+                        # with a partition before it gets there.
 
 # --- collected by the functions below --------------------------------------
 TABLE_MODE=exclude      # exclude: back up everything but the listed tables
@@ -1180,6 +1184,15 @@ cmd_status() {
         local behind
         behind=$(git_in_repo rev-list --count "${there:-}..HEAD" 2>/dev/null || printf '?')
         problem "$behind commit(s) not pushed to $REMOTE/$branch — the backup has not left this machine"
+    fi
+
+    if [ "${FILE_SIZE_LIMIT_MB:-0}" -gt 0 ]; then
+        local limit=$((FILE_SIZE_LIMIT_MB * 1000000)) size path biggest="" biggest_size=0
+        while read -r size path; do
+            if [ "$size" -gt "$biggest_size" ]; then biggest_size=$size; biggest=$path; fi
+        done < <(git_in_repo ls-tree -r -l HEAD | awk '$2 == "blob" {print $4, $5}')
+        [ "$biggest_size" -le "$limit" ] || \
+            problem "$biggest is $((biggest_size / 1000000)) MB, limit ${FILE_SIZE_LIMIT_MB} MB (FILE_SIZE_LIMIT_MB): split the table with a partition before the git host refuses the push"
     fi
 
     printf 'BACKUP OK: last run %s ago, pushed to %s/%s\n' \
